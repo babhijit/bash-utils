@@ -1,0 +1,106 @@
+FAT1 -> FAT2 MIGRATION CHEATSHEET
+===================================
+
+MOCK REHEARSAL (safe — /tmp only)
+---------------------------------
+
+# 1. Build mock from live tree
+bash bin/mock_build.sh \
+    --csv fat2.csv \
+    --source-root /applications/opc_d2 \
+    --mock-root /tmp/mock_f2 \
+    --reset
+# Check: failed=0
+
+# 2. Execute on mock
+bash bin/migrator.sh \
+    --mode execute \
+    --root /tmp/mock_f2 \
+    --csv /tmp/mock_f2/mock_input.csv \
+    --workdir /tmp/migration_f2_mock
+# Check: all COMPLETED, no FAILED
+
+# 3. Validate
+bash bin/validate.sh \
+    --root /tmp/mock_f2 \
+    --workdir /tmp/migration_f2_mock \
+    --verbose
+# Check: VALIDATE PASSED
+
+# 4. Rollback + validate
+bash bin/migrator.sh \
+    --mode rollback \
+    --root /tmp/mock_f2 \
+    --workdir /tmp/migration_f2_mock \
+    --validate
+# Check: Rollback validation passed
+
+# 5. Cleanup mock
+bash bin/migrator.sh \
+    --mode cleanup \
+    --root /tmp/mock_f2 \
+    --workdir /tmp/migration_f2_mock
+rm -rf /tmp/mock_f2 /tmp/migration_f2_mock
+
+
+LIVE MIGRATION
+--------------
+!! Complete in ONE session. Reboot = backups gone = no rollback !!
+
+# 1. Execute
+bash bin/migrator.sh \
+    --mode execute \
+    --root /applications/opc_d2 \
+    --csv fat2.csv \
+    --workdir /tmp/migration_f2 \
+    --yes
+# 5s countdown. Ctrl-C to abort.
+
+# 2. Validate
+bash bin/validate.sh \
+    --root /applications/opc_d2 \
+    --workdir /tmp/migration_f2 \
+    --verbose
+
+# 3. Decision:
+#    GOOD  -> cleanup (permanent, no rollback after this)
+#    BAD   -> rollback
+
+# 3a. Cleanup (point of no return)
+bash bin/migrator.sh \
+    --mode cleanup \
+    --root /applications/opc_d2 \
+    --workdir /tmp/migration_f2
+
+# 3b. Rollback
+bash bin/migrator.sh \
+    --mode rollback \
+    --root /applications/opc_d2 \
+    --workdir /tmp/migration_f2 \
+    --yes \
+    --validate
+
+
+IF KILLED
+---------
+Re-run the same command. It resumes automatically.
+
+  execute killed  -> re-run execute (same args)
+  rollback killed -> re-run rollback (same args)
+
+
+IF VALIDATE FAILS
+-----------------
+DO NOT cleanup. Rollback first, investigate, retry.
+
+bash bin/migrator.sh \
+    --mode rollback \
+    --root /applications/opc_d2 \
+    --workdir /tmp/migration_f2 \
+    --yes --validate
+
+
+IF /tmp WIPED
+-------------
+Backups gone. Cannot rollback.
+Re-run selective_copy.sh from fat1 user to restore.
