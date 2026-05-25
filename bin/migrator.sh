@@ -1,388 +1,686 @@
 #!/bin/bash
 # =============================================================================
 #
-# Script:      migrator.sh (Definitive Version)
+# Script:      migrator.sh
 #
 # Description:
-#   A stateful, in-place migration script with backup, rollback, and cleanup.
-#   This version uses robust file-reading patterns to prevent common bugs.
+#   Stateful, in-place path/content migrator with backup, resume, rollback,
+#   and cleanup. Designed for DR work where messing up the target tree
+#   would cause tremendous delays — see the safety gates throughout.
+#
+#   Modes:
+#     execute   - apply forward migration to paths listed in --csv
+#     rollback  - restore every backed-up path to its pre-migration state
+#     cleanup   - delete all backups and tracking state for the workdir
+#     validate  - check that the migration is internally consistent
+#                 (every COMPLETED row's live state differs from its backup
+#                  if and only if the row's path/content should have changed,
+#                  and mtime matches what was recorded at execute time)
+#
+#   Safety gates (live mode):
+#     - --root REQUIRED; every CSV path asserted to be under --root
+#     - --yes REQUIRED unless --root starts with /tmp/
+#     - 5-second countdown after the live-mode summary, abortable with Ctrl-C
+#     - --backup-dir refuses to be the same as --root or under --root
+#
+#   Resume semantics:
+#     - Tracking file at <workdir>/progress.log is canonical.
+#     - On startup, every BACKED_UP-but-not-COMPLETED row triggers a
+#       restore-from-backup followed by re-execution. Backup is the
+#       source of truth; the live path may be in any intermediate state.
+#     - Re-running migrator with the same --workdir resumes; to start
+#       over, run --mode cleanup first.
+#
+#   Backup discipline:
+#     - cp -a everywhere (preserves lstat, no symlink deref).
+#     - Backup tree mirrors the original tree shape under <workdir>/backups/
+#       so collisions are impossible regardless of basename overlap.
+#     - mtime is restored AFTER every mutation via touch -h -d.
+#
+# Bash version floor: 4.2 (per common.sh).
 #
 # =============================================================================
 
 # --- Script Safety and Rigor -------------------------------------------------
-if ((BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 2))); then
-    echo "Error: This script requires Bash version 4.2 or higher. Found: ${BASH_VERSION}." >&2
-    exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
+source "${SCRIPT_DIR}/common.sh"
+require_bash_version 4 2
 set -euo pipefail
 
 # =============================================================================
 #                                 CONFIGURATION
 # =============================================================================
+#
+# Forward mapping ONLY. The reverse mapping is derived at runtime via
+# derive_reverse_map() — change keys here, the reverse stays in sync.
+#
+# Both path and content rewrites use the same map. If a future job needs
+# separate maps for paths vs contents, split this into two declarations.
 
-# --- Forward Mappings --------------------------------------------------------
-# NOTE: -Ar = associative + readonly in one flag bundle. The previous form
-# `declare -A readonly NAME=(...)` was a latent bug: bash parsed `readonly`
-# as a separate variable name, so NAME was never actually readonly and a
-# stray empty array literally called `readonly` got declared instead.
-declare -Ar PATH_REPLACE_MAPPING=(
+declare -Ar MIGRATION_MAP=(
     ["FAT1"]="FAT2"
     ["fat1"]="fat2"
     ["opc_d1"]="opc_d2"
     ["xbapp_d1"]="xbapp_d2"
     ["opcsvcf1"]="opcsvcf2"
 )
-declare -Ar CONTENT_REPLACE_MAPPING=(
-    ["FAT1"]="FAT2"
-    ["fat1"]="fat2"
-    ["opcsvcf1"]="opcsvcf2"
-    ["opc_d1"]="opc_d2"
-    ["xbapp_d1"]="xbapp_d2"
-)
 
-# --- Reverse Mappings (for validation) ---------------------------------------
-declare -Ar REVERSE_PATH_REPLACE_MAPPING=(
-    ["FAT2"]="FAT1"
-    ["fat2"]="fat1"
-    ["opc_d2"]="opc_d1"
-    ["xbapp_d2"]="xbapp_d1"
-    ["opcsvcf2"]="opcsvcf1"
-)
-declare -Ar REVERSE_CONTENT_REPLACE_MAPPING=(
-    ["FAT2"]="FAT1"
-    ["fat2"]="fat1"
-    ["opcsvcf2"]="opcsvcf1"
-    ["opc_d2"]="opc_d1"
-    ["xbapp_d2"]="xbapp_d1"
-)
+# Derived at runtime. Kept as a regular declare (not readonly) because
+# derive_reverse_map populates it post-declaration.
+declare -A REVERSE_MIGRATION_MAP=()
+derive_reverse_map MIGRATION_MAP REVERSE_MIGRATION_MAP
 
 # =============================================================================
-#                                  SCRIPT LOGIC
+#                                 GLOBAL STATE
 # =============================================================================
+#
+# Set by main() after CLI parsing. Sub-functions read these globals rather
+# than receive long argument lists.
 
-LOG_FILE="migrator_$(date +'%Y%m%d_%H%M%S').log"
-TRACKING_FILE="migration_progress.log"
-BACKUP_DIR="/tmp/migrator_backups_$(date +'%Y%m%d_%H%M%S')"
+MODE=""
+CSV_FILE=""
+ROOT=""
+WORKDIR=""
+BACKUP_DIR=""
+TRACKING_FILE=""
+LOG_FILE_PATH=""        # exported as LOG_FILE for common.sh log()
+DRY_RUN=0
+ASSUME_YES=0
 
-log() {
-    local level="$1"
-    local message="$2"
-    echo "$(date +'%Y-%m-%d %H:%M:%S') - ${level} - ${message}" | tee -a "${LOG_FILE}"
-}
+# =============================================================================
+#                                  USAGE
+# =============================================================================
 
 usage() {
-    echo "Usage: $0 --mode <execute|rollback|cleanup> --csv <input.csv> [options]"
+    cat >&2 <<EOF
+Usage: $0 --mode <execute|rollback|cleanup|validate> --root <path> [options]
+
+REQUIRED for execute:
+  --mode execute
+  --root  PATH    The fat2 base (e.g. /applications/opc_d2). Every CSV path
+                  must be under this directory or migrator refuses.
+  --csv   PATH    3-column CSV: Name,Absolute_Path,Last_Modified
+
+REQUIRED for rollback/cleanup/validate:
+  --mode <rollback|cleanup|validate>
+  --root  PATH    Same as the prior execute (used to refuse cross-root operations)
+
+OPTIONAL:
+  --workdir      PATH   Default: /tmp/migration_f2
+                        Holds backups, tracking, and run logs. A re-run with
+                        the same --workdir RESUMES from the tracking file.
+  --backup-dir   PATH   Default: <workdir>/backups
+                        Refuses to be under --root.
+  --tracking-file PATH  Default: <workdir>/progress.log
+  --log-file     PATH   Default: <workdir>/migrator_<run-id>.log
+  --dry-run             Print what would happen; touch no disk state.
+  --yes                 Skip the live-mode confirmation countdown.
+                        Required for non-/tmp roots. Test harnesses should
+                        set NONINTERACTIVE=1 instead.
+
+EXAMPLES:
+  # Mock run (safe, scratch tree under /tmp)
+  $0 --mode execute --root /tmp/mock_f2 --csv /tmp/mock_f2/mock_input.csv
+
+  # Live run (requires --yes + countdown)
+  $0 --mode execute --root /applications/opc_d2 --csv ./fat2.csv --yes
+
+  # Resume a killed run (just re-invoke; tracking file in --workdir)
+  $0 --mode execute --root /applications/opc_d2 --csv ./fat2.csv --yes
+
+  # Roll everything back
+  $0 --mode rollback --root /applications/opc_d2
+
+  # Delete backups + tracking after validation passes
+  $0 --mode cleanup --root /applications/opc_d2
+EOF
     exit 1
 }
 
-# -----------------------------------------------------------------------------
-# replace_content_in_file <TARGET_FILE> <ARRAY_NAME>
-# Replace every occurrence of each key in the named associative array with its
-# value, in $TARGET_FILE. Uses eval-based indirection because bash 4.2 lacks
-# `declare -n` (namerefs require 4.3+).
-# -----------------------------------------------------------------------------
-replace_content_in_file() {
-    local target_file="$1"
-    local array_name_str="$2"  # The name of the associative array to use
+# =============================================================================
+#                            BACKUP PATH MAPPING
+# =============================================================================
+#
+# Backup tree mirrors the original tree shape so collisions are impossible.
+# Example:  /applications/opc_d2/conf/x.xml
+#       ->  <backup_dir>/applications/opc_d2/conf/x.xml
+#
+# This means rollback can use the same structural mapping to find each
+# row's backup without consulting the tracking file beyond row-existence.
 
-    # Fetch keys of the named associative array (portable to bash 4.2).
-    # Outer shell expands ${array_name_str}; eval handles the ${!ARR[@]} part.
-    local keys
-    eval "keys=( \"\${!${array_name_str}[@]}\" )"
-
-    if [ ${#keys[@]} -eq 0 ]; then
-        return 0
-    fi
-
-    if [ ! -f "$target_file" ] || [ -L "$target_file" ]; then
-        return 0
-    fi
-
-    log "INFO" "Content Replace: Starting on $target_file using '$array_name_str'"
-    local sed_expressions=()
-    local key value
-    for key in "${keys[@]}"; do
-        eval "value=\${${array_name_str}[\"\$key\"]}"
-        sed_expressions+=(-e "s|${key}|${value}|g")
-    done
-
-    local tmp_file; tmp_file=$(mktemp)
-    if ! sed "${sed_expressions[@]}" "$target_file" > "$tmp_file"; then
-        log "ERROR" "Content Replace: sed command failed on $target_file."
-        rm -f "$tmp_file"
-        return 1
-    fi
-
-    mv "$tmp_file" "$target_file"
-}
-
-# --- Mode: Execute -----------------------------------------------------------
-run_execute() {
-    local csv_file="$1"
-    log "INFO" "Mode: EXECUTE. Starting migration."
-    log "INFO" "Backups will be stored in: ${BACKUP_DIR}"
-    mkdir -p "${BACKUP_DIR}"
-
-    declare -A completed_paths
-    if [ -f "$TRACKING_FILE" ]; then
-        log "INFO" "Reading existing tracking file: $TRACKING_FILE"
-
-        local temp_log_file
-        temp_log_file=$(mktemp)
-        tail -n +2 "$TRACKING_FILE" > "$temp_log_file"
-
-        while IFS=, read -r path _ _ _ status; do
-            path="${path//\"/}"
-            status="${status//\"/}"
-            if [ "$status" == "COMPLETED" ]; then
-                completed_paths["$path"]=1
-            fi
-        done < "$temp_log_file"
-        rm "$temp_log_file"
-
-        log "INFO" "Found ${#completed_paths[@]} previously completed entries to skip."
-    else
-        log "INFO" "No tracking file found. Starting a new migration."
-        echo "Original_Path,New_Path,Backup_Path,Original_Timestamp,Status" > "$TRACKING_FILE"
-    fi
-
-    local line_count=0
-    local processed_count=0
-
-    local temp_csv_file
-    temp_csv_file=$(mktemp)
-    tail -n +2 "$csv_file" | awk -F, '!seen[$2]++' > "$temp_csv_file"
-
-    while IFS=, read -r name absolute_path last_modified; do
-        name="${name//\"/}"
-        absolute_path="${absolute_path//\"/}"
-        last_modified="${last_modified//\"/}"
-        absolute_path="${absolute_path%$'\r'}"
-
-        line_count=$((line_count + 1))
-        echo -ne "Processing entry $line_count: $name\r" >&2
-
-        if [ -n "${completed_paths[$absolute_path]:-}" ]; then
-            continue
-        fi
-        if [ ! -e "$absolute_path" ] && [ ! -L "$absolute_path" ]; then
-            log "WARN" "SKIP: Source path not found: $absolute_path"
-            continue
-        fi
-
-        local new_path="$absolute_path"
-        for find_str in "${!PATH_REPLACE_MAPPING[@]}"; do
-            new_path="${new_path//$find_str/${PATH_REPLACE_MAPPING[$find_str]}}"
-        done
-        local backup_path="${BACKUP_DIR}/$(basename "$absolute_path")_$(date +%s)"
-
-        if ! cp -a "$absolute_path" "$backup_path"; then
-            log "ERROR" "BACKUP failed for '$absolute_path'. Halting."; exit 1
-        fi
-
-        local backed_up_line="\"$absolute_path\",\"$new_path\",\"$backup_path\",\"$last_modified\",\"BACKED_UP\""
-        echo "$backed_up_line" >> "$TRACKING_FILE"
-
-        if [ -L "$absolute_path" ]; then
-            log "INFO" "Processing Symlink: $absolute_path"
-            local old_target; old_target=$(readlink "$absolute_path")
-            local new_target="$old_target"
-            for find_str in "${!PATH_REPLACE_MAPPING[@]}"; do
-                new_target="${new_target//$find_str/${PATH_REPLACE_MAPPING[$find_str]}}"
-            done
-
-            rm "$absolute_path"
-            ln -s "$new_target" "$absolute_path"
-            log "INFO" "Symlink Target Updated: -> $new_target"
-
-            if [ "$absolute_path" != "$new_path" ]; then
-                mv "$absolute_path" "$new_path"
-                log "INFO" "Symlink Renamed: -> $new_path"
-            fi
-        elif [ -d "$absolute_path" ]; then
-            log "INFO" "Processing Directory: $absolute_path"
-            if [ "$absolute_path" != "$new_path" ]; then
-                mv "$absolute_path" "$new_path"
-                log "INFO" "Directory Renamed: -> $new_path"
-            fi
-            # Process substitution (not pipe) keeps the loop in this shell.
-            while IFS= read -r -d '' file_in_dir; do
-                replace_content_in_file "$file_in_dir" "CONTENT_REPLACE_MAPPING"
-            done < <(find "$new_path" -type f -print0)
-        elif [ -f "$absolute_path" ]; then
-            log "INFO" "Processing File: $absolute_path"
-            replace_content_in_file "$absolute_path" "CONTENT_REPLACE_MAPPING"
-            if [ "$absolute_path" != "$new_path" ]; then
-                mv "$absolute_path" "$new_path"
-                log "INFO" "File Renamed: -> $new_path"
-            fi
-        fi
-
-        local final_path="$new_path"
-        if ! touch -h -d "$last_modified" "$final_path"; then
-            log "WARN" "Timestamp restore failed for: $final_path"
-        fi
-
-        local temp_tracking_file; temp_tracking_file=$(mktemp)
-        local completed_line="\"$absolute_path\",\"$new_path\",\"$backup_path\",\"$last_modified\",\"COMPLETED\""
-        # grep -v exits 1 if every line matches (zero survive). Guard so
-        # set -e + pipefail can't kill us on that edge case.
-        grep -vF "$backed_up_line" "$TRACKING_FILE" > "$temp_tracking_file" || true
-        echo "$completed_line" >> "$temp_tracking_file"
-        mv "$temp_tracking_file" "$TRACKING_FILE"
-
-        log "SUCCESS" "COMPLETED: $absolute_path"
-        processed_count=$((processed_count + 1))
-    done < "$temp_csv_file"
-    rm "$temp_csv_file"
-
-    echo -ne "\033[2K\r" >&2
-    log "INFO" "EXECUTE mode finished. Processed $processed_count new entries."
-}
-
-# --- Other modes (rollback, cleanup) -----------------------------------------
-run_rollback() {
-    log "INFO" "Mode: ROLLBACK. Reverting changes from tracking file."
-    if [ ! -f "$TRACKING_FILE" ]; then
-        log "ERROR" "Tracking file not found. Cannot rollback."
-        exit 1
-    fi
-
-    local reverse_cmd
-    if command -v tac >/dev/null; then
-        reverse_cmd="tac"
-    else
-        reverse_cmd="tail -r"
-    fi
-
-    local temp_log_file
-    temp_log_file=$(mktemp)
-    $reverse_cmd "$TRACKING_FILE" | grep -v "Original_Path,New_Path,Backup_Path,Original_Timestamp,Status" > "$temp_log_file" || true
-
-    while IFS=, read -r orig_path new_path backup_path ts status; do
-        orig_path="${orig_path//\"/}"
-        new_path="${new_path//\"/}"
-        backup_path="${backup_path//\"/}"
-
-        log "INFO" "Rollback: Examining entry for '$orig_path'"
-        if [ -e "$new_path" ] || [ ! -e "$orig_path" ]; then
-            log "INFO" "Action: Restoring '$orig_path' from '$backup_path'"
-            rm -rf "$new_path"
-            if ! cp -a "$backup_path" "$orig_path"; then
-                log "ERROR" "ROLLBACK FAILED for '$orig_path'. Manual intervention may be required."
-            else
-                log "SUCCESS" "Rolled back '$orig_path'"
-            fi
-        else
-            log "INFO" "Skip: '$orig_path' appears to be in its original state."
-        fi
-    done < "$temp_log_file"
-    rm "$temp_log_file"
-    log "INFO" "ROLLBACK mode finished."
-}
-
-run_cleanup() {
-    log "INFO" "Mode: CLEANUP. Removing backup files."
-    if [ ! -f "$TRACKING_FILE" ]; then
-        log "ERROR" "Tracking file not found. Cannot clean up."
-        exit 1
-    fi
-
-    local temp_log_file
-    temp_log_file=$(mktemp)
-    tail -n +2 "$TRACKING_FILE" > "$temp_log_file"
-
-    while IFS=, read -r _ _ backup_path _; do
-        backup_path="${backup_path//\"/}"
-        if [ -e "$backup_path" ] || [ -L "$backup_path" ]; then
-            log "INFO" "Removing backup: $backup_path"
-            rm -rf "$backup_path"
-        fi
-    done < "$temp_log_file"
-    rm "$temp_log_file"
-
-    # Resolve the actual backup directory used at execute-time from the log.
-    # Guarded against missing log file and missing "Backups will be stored in"
-    # line so set -e + pipefail can't kill us on a benign absence.
-    local backup_dir_from_log=""
-    if [ -f "${LOG_FILE}" ]; then
-        backup_dir_from_log=$(grep "Backups will be stored in" "${LOG_FILE}" | head -n1 | awk '{print $NF}') || true
-    fi
-    # FIX: previous form was `[ -d "$x" ] && [ -d "$x" ]` — same check twice.
-    # Intent was non-empty AND is-a-directory.
-    if [ -n "$backup_dir_from_log" ] && [ -d "$backup_dir_from_log" ]; then
-        rmdir "$backup_dir_from_log" 2>/dev/null || log "INFO" "Backup directory '$backup_dir_from_log' not empty, leaving as is."
-    fi
-    log "INFO" "CLEANUP mode finished."
+backup_path_for() {
+    local original="$1"
+    printf '%s%s' "$BACKUP_DIR" "$original"
 }
 
 # =============================================================================
-#                                 Main Entry Point
+#                            TRACKING FILE FORMAT
 # =============================================================================
-main() {
-    local mode=""
-    local csv_file=""
+#
+# Append-only CSV. Columns:
+#   Original_Path,New_Path,Backup_Path,Original_Timestamp,Status
+#
+# Status is one of: BACKED_UP, COMPLETED, ROLLED_BACK.
+#
+# The latest status for a given Original_Path wins. We never rewrite the
+# file in place (avoids the O(n²) cost of the previous design).
 
+tracking_header() {
+    echo "Original_Path,New_Path,Backup_Path,Original_Timestamp,Status"
+}
+
+tracking_append() {
+    local orig="$1" newp="$2" bkp="$3" ts="$4" status="$5"
+    printf '"%s","%s","%s","%s","%s"\n' \
+        "$orig" "$newp" "$bkp" "$ts" "$status" >> "$TRACKING_FILE"
+}
+
+# tracking_latest_status_for <path>
+# Echoes the latest status for <path>, or empty string if never recorded.
+tracking_latest_status_for() {
+    local target="$1"
+    [ -f "$TRACKING_FILE" ] || { echo ""; return; }
+    # Reverse-walk to find the most recent entry first. tac is widely
+    # available on Linux; we don't need the macOS shim here.
+    local status
+    status=$(tac "$TRACKING_FILE" 2>/dev/null \
+        | awk -F'","' -v target="\"$target" '
+            $1 == target { gsub(/"$/, "", $5); print $5; exit }
+        ') || true
+    echo "$status"
+}
+
+# =============================================================================
+#                              ARGUMENT PARSING
+# =============================================================================
+
+parse_args() {
+    if [ "$#" -eq 0 ]; then usage; fi
     while [ "$#" -gt 0 ]; do
         case "$1" in
-            --mode)
-                mode="$2"
-                shift 2
-                ;;
-            --csv)
-                csv_file="$2"
-                shift 2
-                ;;
-            --log-file)
-                LOG_FILE="$2"
-                shift 2
-                ;;
-            --tracking-file)
-                TRACKING_FILE="$2"
-                shift 2
-                ;;
-            --backup-dir)
-                BACKUP_DIR="$2"
-                shift 2
-                ;;
-            *)
-                echo "Error: Unknown argument '$1'" >&2
-                usage
-                ;;
+            --mode)          MODE="$2"; shift 2 ;;
+            --csv)           CSV_FILE="$2"; shift 2 ;;
+            --root)          ROOT="$2"; shift 2 ;;
+            --workdir)       WORKDIR="$2"; shift 2 ;;
+            --backup-dir)    BACKUP_DIR="$2"; shift 2 ;;
+            --tracking-file) TRACKING_FILE="$2"; shift 2 ;;
+            --log-file)      LOG_FILE_PATH="$2"; shift 2 ;;
+            --dry-run)       DRY_RUN=1; shift ;;
+            --yes)           ASSUME_YES=1; shift ;;
+            -h|--help)       usage ;;
+            *) echo "Error: Unknown argument '$1'" >&2; usage ;;
         esac
     done
 
-    if [ -z "$mode" ]; then
-        echo "Error: --mode is required." >&2
-        usage
-    fi
-    if [[ "$mode" == "execute" && -z "$csv_file" ]]; then
-        echo "Error: --csv is required for execute mode." >&2
+    [ -n "$MODE" ] || { echo "Error: --mode is required" >&2; usage; }
+    [ -n "$ROOT" ] || { echo "Error: --root is required" >&2; usage; }
+
+    case "$MODE" in
+        execute|rollback|cleanup|validate) ;;
+        *) echo "Error: invalid --mode '$MODE'" >&2; usage ;;
+    esac
+
+    if [ "$MODE" = "execute" ] && [ -z "$CSV_FILE" ]; then
+        echo "Error: --csv is required for --mode execute" >&2
         usage
     fi
 
-    case "$mode" in
-        execute)
-            run_execute "$csv_file"
+    # Defaults — derived only after --workdir is known.
+    WORKDIR="${WORKDIR:-/tmp/migration_f2}"
+    BACKUP_DIR="${BACKUP_DIR:-${WORKDIR}/backups}"
+    TRACKING_FILE="${TRACKING_FILE:-${WORKDIR}/progress.log}"
+    LOG_FILE_PATH="${LOG_FILE_PATH:-${WORKDIR}/migrator_$(new_run_id).log}"
+
+    # Normalize for assert_under_root and equality checks.
+    ROOT="$(normalize_path "$ROOT")"
+    BACKUP_DIR="$(normalize_path "$BACKUP_DIR")"
+
+    # Backup dir MUST NOT be the same as --root or live under it. If it were,
+    # a rollback would restore from a tree we're actively rewriting.
+    if [ "$BACKUP_DIR" = "$ROOT" ] || [[ "$BACKUP_DIR" == "$ROOT"/* ]]; then
+        echo "Error: --backup-dir ('$BACKUP_DIR') cannot be under --root ('$ROOT')" >&2
+        exit 2
+    fi
+}
+
+# =============================================================================
+#                                LIVE-MODE GATE
+# =============================================================================
+
+is_live_root() {
+    # /tmp/* roots are considered "mock" — no countdown, no --yes required.
+    [[ "$ROOT" != /tmp/* ]] && [ "$ROOT" != "/tmp" ]
+}
+
+live_safety_gate() {
+    if ! is_live_root; then
+        info "Root '$ROOT' is under /tmp; treating as mock run (no countdown)"
+        return 0
+    fi
+
+    if [ "$ASSUME_YES" -ne 1 ]; then
+        die "Live root '$ROOT' requires --yes to confirm intent" 2
+    fi
+
+    local n_rows=0
+    if [ -f "$CSV_FILE" ]; then
+        n_rows=$(( $(wc -l < "$CSV_FILE") - 1 ))
+    fi
+
+    local msg="LIVE migration on '$ROOT' — about to mutate up to $n_rows paths. Backups: $BACKUP_DIR"
+    confirm_with_countdown "$msg"
+}
+
+# =============================================================================
+#                              EXECUTE  (forward)
+# =============================================================================
+
+# process_row <name> <orig_path> <ts>
+# Migrate one CSV row to its fat2 form. Idempotent: safe to retry.
+# All mutations gated by DRY_RUN.
+process_row() {
+    local name="$1"
+    local orig_path="$2"
+    local ts="$3"
+
+    # Safety: refuse anything outside --root.
+    assert_under_root "$orig_path" "$ROOT"
+
+    # New path is the forward-mapped form of original.
+    local new_path
+    new_path="$(apply_path_mapping "$orig_path" MIGRATION_MAP)"
+
+    # Resume decision based on tracking history for this row.
+    local prior_status
+    prior_status="$(tracking_latest_status_for "$orig_path")"
+
+    case "$prior_status" in
+        COMPLETED)
+            info "SKIP (already completed): $orig_path"
+            return 0
             ;;
-        rollback)
-            run_rollback
+        BACKED_UP)
+            # Partial state from a prior killed run.
+            if [ "$DRY_RUN" -eq 1 ]; then
+                info "DRY-RUN: row in BACKED_UP state; would restore from backup before redoing: $orig_path"
+                return 0
+            fi
+            warn "RESUME: previous run left $orig_path in BACKED_UP state. Restoring from backup before redoing."
+            restore_from_backup "$orig_path"
             ;;
-        cleanup)
-            run_cleanup
+        ROLLED_BACK|"")
+            : # fresh row, nothing to do
             ;;
         *)
-            echo "Error: Invalid mode '$mode'." >&2
-            usage
+            warn "Unknown prior status '$prior_status' for $orig_path; proceeding cautiously"
             ;;
+    esac
+
+    # Source path must exist after any restore.
+    if [ ! -e "$orig_path" ] && [ ! -L "$orig_path" ]; then
+        warn "SKIP: source path not found: $orig_path"
+        return 0
+    fi
+
+    local bkp
+    bkp="$(backup_path_for "$orig_path")"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "DRY-RUN: would back up $orig_path -> $bkp"
+        info "DRY-RUN: would migrate -> $new_path"
+        return 0
+    fi
+
+    # --- Backup ---
+    safe_mkdir_p "$(dirname "$bkp")"
+    if ! cp -a "$orig_path" "$bkp"; then
+        die "BACKUP failed for '$orig_path' -> '$bkp'. Halting before any mutation."
+    fi
+    tracking_append "$orig_path" "$new_path" "$bkp" "$ts" "BACKED_UP"
+
+    # --- Mutate (symlink / dir / file) ---
+    if [ -L "$orig_path" ]; then
+        migrate_symlink "$orig_path" "$new_path"
+    elif [ -d "$orig_path" ]; then
+        migrate_directory "$orig_path" "$new_path"
+    elif [ -f "$orig_path" ]; then
+        migrate_file "$orig_path" "$new_path"
+    else
+        warn "Unrecognized lstat type for $orig_path; skipping mutation"
+    fi
+
+    # --- Restore mtime ---
+    # The mutation steps may have bumped mtime; restore from the timestamp
+    # captured at finder/mock-build time. Use -h so symlinks aren't
+    # dereferenced.
+    if ! restore_mtime_from_human "$new_path" "$ts" 2>/dev/null; then
+        warn "Timestamp restore failed for: $new_path"
+    fi
+
+    tracking_append "$orig_path" "$new_path" "$bkp" "$ts" "COMPLETED"
+    success "COMPLETED: $orig_path"
+}
+
+migrate_symlink() {
+    local orig_path="$1"
+    local new_path="$2"
+
+    local old_target new_target
+    old_target=$(readlink "$orig_path")
+    new_target="$(apply_path_mapping "$old_target" MIGRATION_MAP)"
+
+    rm "$orig_path"
+    ln -s "$new_target" "$orig_path"
+
+    if [ "$orig_path" != "$new_path" ]; then
+        mv "$orig_path" "$new_path"
+    fi
+}
+
+migrate_directory() {
+    local orig_path="$1"
+    local new_path="$2"
+
+    if [ "$orig_path" != "$new_path" ]; then
+        mv "$orig_path" "$new_path"
+    fi
+    # Rewrite contents of every regular file inside, depth-first. Each
+    # rewrite bumps the child's mtime via replace_content_in_file's
+    # truncate-rewrite — we capture the child mtime first and restore
+    # it after. Without this, children inside a renamed directory would
+    # drift away from their fat1 originals.
+    local file_in_dir child_mtime
+    while IFS= read -r -d '' file_in_dir; do
+        child_mtime=$(lstat_mtime_human "$file_in_dir")
+        if ! replace_content_in_file "$file_in_dir" MIGRATION_MAP; then
+            warn "Content replace failed inside directory: $file_in_dir"
+            continue
+        fi
+        if ! restore_mtime_from_human "$file_in_dir" "$child_mtime" 2>/dev/null; then
+            warn "Child mtime restore failed: $file_in_dir"
+        fi
+    done < <(find "$new_path" -type f -print0)
+}
+
+migrate_file() {
+    local orig_path="$1"
+    local new_path="$2"
+
+    if ! replace_content_in_file "$orig_path" MIGRATION_MAP; then
+        warn "Content replace failed: $orig_path"
+    fi
+    if [ "$orig_path" != "$new_path" ]; then
+        mv "$orig_path" "$new_path"
+    fi
+}
+
+run_execute() {
+    info "Mode: EXECUTE  root=$ROOT  workdir=$WORKDIR  dry_run=$DRY_RUN"
+    safe_mkdir_p "$WORKDIR"
+    safe_mkdir_p "$BACKUP_DIR"
+    check_tmpfs_warning "$BACKUP_DIR"
+
+    # Tracking file: create with header if absent.
+    if [ ! -f "$TRACKING_FILE" ]; then
+        tracking_header > "$TRACKING_FILE"
+    fi
+
+    [ -f "$CSV_FILE" ] || die "CSV not found: $CSV_FILE"
+
+    live_safety_gate
+
+    # Reading CSV with a callback that mutates global state (process_row's
+    # tracking appends, dry-run flags, etc.) — csv_read_3col is designed
+    # to run the callback in this shell.
+    csv_read_3col "$CSV_FILE" process_row
+
+    success "EXECUTE finished. See tracking file: $TRACKING_FILE"
+}
+
+# =============================================================================
+#                                ROLLBACK
+# =============================================================================
+#
+# Walks the tracking file in reverse. For every COMPLETED row, restore the
+# original path from its backup. For BACKED_UP-but-not-COMPLETED rows, also
+# restore (no harm done). For ROLLED_BACK rows, skip (already done).
+
+restore_from_backup() {
+    local orig_path="$1"
+    local bkp
+    bkp="$(backup_path_for "$orig_path")"
+
+    if [ ! -e "$bkp" ] && [ ! -L "$bkp" ]; then
+        warn "Backup missing for $orig_path (expected at $bkp); cannot restore"
+        return 1
+    fi
+
+    # If the new (post-migration) path exists, remove it first. We don't
+    # know whether the original path or the new path is currently live, so
+    # remove both possibilities.
+    local new_path
+    new_path="$(apply_path_mapping "$orig_path" MIGRATION_MAP)"
+    if [ "$new_path" != "$orig_path" ] && { [ -e "$new_path" ] || [ -L "$new_path" ]; }; then
+        rm -rf "$new_path"
+    fi
+    if [ -e "$orig_path" ] || [ -L "$orig_path" ]; then
+        rm -rf "$orig_path"
+    fi
+
+    safe_mkdir_p "$(dirname "$orig_path")"
+    if ! cp -a "$bkp" "$orig_path"; then
+        warn "cp -a failed restoring $orig_path from $bkp"
+        return 1
+    fi
+    return 0
+}
+
+run_rollback() {
+    info "Mode: ROLLBACK  root=$ROOT  workdir=$WORKDIR"
+    [ -f "$TRACKING_FILE" ] || die "Tracking file not found: $TRACKING_FILE"
+
+    live_safety_gate
+
+    # Collect the set of original paths we have backups for, by walking the
+    # tracking file. Latest status per path wins. Dedupe via assoc array.
+    declare -A latest_status
+    declare -A ts_for_path
+    local orig newp bkp ts status
+
+    local tmp_log
+    tmp_log=$(mktemp)
+    tail -n +2 "$TRACKING_FILE" > "$tmp_log"
+
+    # Read forward; later entries overwrite earlier. After the loop,
+    # latest_status[path] holds the most recent status.
+    while IFS=, read -r orig newp bkp ts status; do
+        orig=$(csv_strip_field "$orig")
+        ts=$(csv_strip_field "$ts")
+        status=$(csv_strip_field "$status")
+        latest_status["$orig"]="$status"
+        ts_for_path["$orig"]="$ts"
+    done < "$tmp_log"
+    rm -f "$tmp_log"
+
+    # Apply rollback in reverse insertion order. We need the order, so do
+    # a second pass walking the tracking file in reverse and skipping paths
+    # we've already handled.
+    declare -A done_rollback
+    local path
+    local count=0
+    while IFS=, read -r orig _ _ _ _; do
+        orig=$(csv_strip_field "$orig")
+        [ -z "$orig" ] && continue
+        [ -n "${done_rollback[$orig]:-}" ] && continue
+        done_rollback["$orig"]=1
+
+        local cur_status="${latest_status[$orig]:-}"
+        case "$cur_status" in
+            ROLLED_BACK)
+                info "SKIP (already rolled back): $orig"
+                continue
+                ;;
+            COMPLETED|BACKED_UP)
+                if [ "$DRY_RUN" -eq 1 ]; then
+                    info "DRY-RUN: would restore $orig from backup"
+                    continue
+                fi
+                if restore_from_backup "$orig"; then
+                    # Restore mtime on the now-restored path
+                    if ! restore_mtime_from_human "$orig" "${ts_for_path[$orig]}" 2>/dev/null; then
+                        warn "Timestamp restore failed for: $orig"
+                    fi
+                    tracking_append "$orig" "$orig" "$(backup_path_for "$orig")" \
+                        "${ts_for_path[$orig]}" "ROLLED_BACK"
+                    success "ROLLED_BACK: $orig"
+                    count=$((count + 1))
+                else
+                    warn "ROLLBACK failed for: $orig"
+                fi
+                ;;
+            *)
+                warn "Unknown status '$cur_status' for $orig; skipping rollback"
+                ;;
+        esac
+    done < <(tac "$TRACKING_FILE" | grep -v '^Original_Path,')
+
+    success "ROLLBACK finished. Restored $count paths."
+}
+
+# =============================================================================
+#                                CLEANUP
+# =============================================================================
+#
+# Removes backup directory and tracking file. Operator-on-demand only.
+
+run_cleanup() {
+    info "Mode: CLEANUP  root=$ROOT  workdir=$WORKDIR"
+
+    if [ "$DRY_RUN" -eq 1 ]; then
+        info "DRY-RUN: would remove backup dir: $BACKUP_DIR"
+        info "DRY-RUN: would remove tracking file: $TRACKING_FILE"
+        return 0
+    fi
+
+    if [ -d "$BACKUP_DIR" ]; then
+        info "Removing backup directory: $BACKUP_DIR"
+        rm -rf "$BACKUP_DIR"
+    else
+        info "No backup directory to remove (already gone or never created)"
+    fi
+    if [ -f "$TRACKING_FILE" ]; then
+        info "Removing tracking file: $TRACKING_FILE"
+        rm -f "$TRACKING_FILE"
+    fi
+    success "CLEANUP finished."
+}
+
+# =============================================================================
+#                                VALIDATE
+# =============================================================================
+#
+# Internal-consistency check. For every COMPLETED row:
+#   - The new_path exists (or is a symlink).
+#   - The backup at backup_path_for(orig) exists.
+#   - For files: backup vs new content differs IFF the file had content to
+#     rewrite (otherwise they're equal).
+#   - The new_path's mtime equals the recorded timestamp.
+#
+# Does NOT cross-check against fat1 — that's a separate validator.
+
+run_validate() {
+    info "Mode: VALIDATE  root=$ROOT  workdir=$WORKDIR"
+    [ -f "$TRACKING_FILE" ] || die "Tracking file not found: $TRACKING_FILE"
+
+    local pass=0
+    local fail=0
+
+    declare -A latest_status
+    declare -A new_for
+    declare -A ts_for
+    local orig newp bkp ts status
+
+    local tmp_log
+    tmp_log=$(mktemp)
+    tail -n +2 "$TRACKING_FILE" > "$tmp_log"
+    while IFS=, read -r orig newp bkp ts status; do
+        orig=$(csv_strip_field "$orig")
+        newp=$(csv_strip_field "$newp")
+        ts=$(csv_strip_field "$ts")
+        status=$(csv_strip_field "$status")
+        latest_status["$orig"]="$status"
+        new_for["$orig"]="$newp"
+        ts_for["$orig"]="$ts"
+    done < "$tmp_log"
+    rm -f "$tmp_log"
+
+    local path
+    for path in "${!latest_status[@]}"; do
+        local s="${latest_status[$path]}"
+        [ "$s" = "COMPLETED" ] || continue
+
+        local np="${new_for[$path]}"
+        local bp; bp="$(backup_path_for "$path")"
+        local expected_ts="${ts_for[$path]}"
+
+        # 1. New path exists
+        if [ ! -e "$np" ] && [ ! -L "$np" ]; then
+            warn "VALIDATE FAIL: missing migrated path: $np"
+            fail=$((fail + 1))
+            continue
+        fi
+
+        # 2. Backup exists
+        if [ ! -e "$bp" ] && [ ! -L "$bp" ]; then
+            warn "VALIDATE FAIL: missing backup: $bp"
+            fail=$((fail + 1))
+            continue
+        fi
+
+        # 3. mtime matches recorded ts
+        local actual_epoch expected_epoch
+        actual_epoch=$(lstat_mtime_epoch "$np")
+        expected_epoch=$(date -d "$expected_ts" +%s 2>/dev/null) || expected_epoch=""
+        if [ -n "$expected_epoch" ] && [ "$actual_epoch" != "$expected_epoch" ]; then
+            warn "VALIDATE FAIL: mtime mismatch for $np (have $actual_epoch, expected $expected_epoch)"
+            fail=$((fail + 1))
+            continue
+        fi
+
+        pass=$((pass + 1))
+    done
+
+    info "VALIDATE summary: pass=$pass  fail=$fail"
+    [ "$fail" -eq 0 ] || exit 1
+}
+
+# =============================================================================
+#                                MAIN
+# =============================================================================
+
+main() {
+    parse_args "$@"
+
+    safe_mkdir_p "$WORKDIR"
+    export LOG_FILE="$LOG_FILE_PATH"
+    : > "$LOG_FILE"   # truncate per-run log
+
+    info "migrator.sh starting"
+    info "  mode=$MODE  root=$ROOT  workdir=$WORKDIR"
+    info "  backup_dir=$BACKUP_DIR  tracking=$TRACKING_FILE"
+
+    case "$MODE" in
+        execute)  run_execute  ;;
+        rollback) run_rollback ;;
+        cleanup)  run_cleanup  ;;
+        validate) run_validate ;;
     esac
 }
 
-# FIX: Only run main when this script is *executed*, not when it's sourced.
-# setup_migrator_test.sh sources this file in validate_integrity mode to
-# pull in the REVERSE_*_MAPPING arrays and replace_content_in_file(). Without
-# this guard, sourcing would immediately fire main() with the sourcing
-# script's argv, fail mode validation, and exit 1 — killing the caller.
+# Only run main when executed; allow other scripts to source this for
+# access to MIGRATION_MAP, derive_reverse_map result, and helpers like
+# backup_path_for() in test harnesses.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi

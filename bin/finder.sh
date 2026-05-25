@@ -4,53 +4,61 @@
 # Script:      finder.sh
 #
 # Description:
-#   Searches for files, directories, and symbolic links from a top-level
-#   directory based on predefined lists of patterns. Can search by name,
-#   by content, or perform both searches in a single, optimized pass.
-#   Content search automatically skips binary files and user-defined patterns.
-#   All searches are case-insensitive and follow symbolic links.
-#   Provides real-time progress updates to the console (stderr).
+#   Searches a directory tree for files, directories, and symlinks whose
+#   names OR contents match patterns from the migration map. Emits a CSV
+#   suitable for migrator.sh (when --minimal is passed) or for diagnostics
+#   (default 5-column form with match-type/match-value).
 #
-# Outputs:
-#   A CSV-formatted list of matches with the columns:
-#   Name,Absolute_Path,Match_Filter_Type,Filter_Value,Last_Modified
+#   Search is case-insensitive throughout (names via -iname, contents via
+#   grep -i). Follows symbolic links (-L) so a single tree with a symlink
+#   into another part of the FS is fully covered.
+#
+#   PATTERNS COME FROM migrator.sh's MIGRATION_MAP, sourced at startup. This
+#   guarantees finder searches for exactly the things migrator can rewrite —
+#   no risk of finder finding a pattern migrator won't handle, or vice versa.
+#
+# Modes:
+#   --mode name     Match by basename only.
+#   --mode content  Match by file content only (skips binaries and
+#                   CONTENT_SEARCH_EXCLUDE_FILES).
+#   --mode both     Single-pass combined search (~2x faster than running
+#                   name + content separately).
+#
+# Output (stdout, CSV):
+#   Default: Name,Absolute_Path,Match_Filter_Type,Filter_Value,Last_Modified
+#   --minimal: Name,Absolute_Path,Last_Modified
+#
+#   Default always dedupes by absolute path; if the same path matches by
+#   both name and content, the row is emitted once with Match_Filter_Type
+#   = "Both" and Filter_Value listing both.
 #
 # =============================================================================
 
 # --- Script Safety and Rigor -------------------------------------------------
-# Requires Bash 4.0+ for `${var,,}` case-folding parameter expansion.
-if ((BASH_VERSINFO[0] < 4)); then
-    echo "Error: This script requires Bash 4.0 or higher. Found: ${BASH_VERSION}." >&2
-    exit 1
-fi
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=common.sh
+source "${SCRIPT_DIR}/common.sh"
+# Source migrator.sh for MIGRATION_MAP. Its sourcing guard prevents main()
+# from running when sourced.
+# shellcheck source=migrator.sh
+source "${SCRIPT_DIR}/migrator.sh"
+require_bash_version 4 0
 set -euo pipefail
 
 # =============================================================================
 #                                 CONFIGURATION
 # =============================================================================
+#
+# Patterns are the KEYS of MIGRATION_MAP (from migrator.sh). Both name and
+# content searches use the same set — anything finder finds is something
+# migrator can rewrite, by construction.
 
-# --- Filesystem Name Search Patterns -----------------------------------------
-# A list of glob patterns to search for in file, directory, or symlink names.
-readonly NAME_SEARCH_PATTERNS=(
-    "fat1"
-    "opcsvcf1"
-    "opc_d1"
-    "xbapp_d1"
-    "FROPC2U"
-)
+readonly NAME_SEARCH_PATTERNS=( "${!MIGRATION_MAP[@]}" )
+readonly CONTENT_SEARCH_PATTERNS=( "${!MIGRATION_MAP[@]}" )
 
-# --- File Content Search Patterns --------------------------------------------
-# A list of strings/regex patterns to search for within file contents.
-readonly CONTENT_SEARCH_PATTERNS=(
-    "fat1"
-    "opcsvcf1"
-    "opc_d1"
-    "xbapp_d1"
-    "FROPC2U"
-)
-
-# --- Content Search Exclusion Patterns ---------------------------------------
-# A list of file name patterns to exclude from CONTENT searches.
+# Files NOT to scan for content (still searchable by name). Binary/archive
+# formats and large log files where a grep match would be expensive or
+# meaningless.
 readonly CONTENT_SEARCH_EXCLUDE_FILES=(
     "*.log"
     "*.log.*"
@@ -62,8 +70,8 @@ readonly CONTENT_SEARCH_EXCLUDE_FILES=(
     "*.class"
 )
 
-# --- Directory Exclusion List ------------------------------------------------
-# A list of directory names to completely exclude from ALL searches.
+# Directories pruned from ALL searches. -iname is used in build_prune_args
+# so case mismatches (Log vs log) are handled.
 readonly EXCLUDE_DIRS=(
     "log"
     "docs"
@@ -82,42 +90,76 @@ readonly EXCLUDE_DIRS=(
 )
 
 # =============================================================================
-#                                  SCRIPT LOGIC
+#                              GLOBAL STATE
 # =============================================================================
 
-# -----------------------------------------------------------------------------
-# usage
-# -----------------------------------------------------------------------------
+MODE=""
+SEARCH_DIR=""
+OUTPUT_FILE=""
+MINIMAL=0
+
+# Per-path match accumulators (assoc array, key = absolute path).
+declare -A MATCH_NAME_VALUES   # path -> "fat1,opc_d1"
+declare -A MATCH_CONTENT_VALUES
+declare -A MATCH_LSTAT_TS      # path -> stat -c %y output
+
+# =============================================================================
+#                              ARGUMENT PARSING
+# =============================================================================
+
 usage() {
-    echo "Usage: $0 --mode [name|content|both] --dir <search_directory> [--output <output_file>]"
-    echo ""
-    echo "Arguments:"
-    echo "  --mode    'name', 'content', or 'both' to perform both searches at once."
-    echo "            (Patterns are configured inside the script)."
-    echo "  --dir     The top-level directory to start the search from."
-    echo "  --output  (Optional) The file to write CSV results to. Prints to console if omitted."
+    cat >&2 <<EOF
+Usage: $0 --mode <name|content|both> --dir <path> [--output <file>] [--minimal]
+
+Arguments:
+  --mode      name | content | both
+  --dir       Top-level directory to search (follows symlinks)
+  --output    Write CSV to file instead of stdout
+  --minimal   Emit 3-column CSV (Name,Absolute_Path,Last_Modified) suitable
+              for migrator.sh, instead of the default 5-column diagnostic form.
+
+Patterns are taken from migrator.sh's MIGRATION_MAP keys.
+EOF
     exit 1
 }
 
-# -----------------------------------------------------------------------------
+parse_args() {
+    if [ "$#" -eq 0 ]; then usage; fi
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --mode)     MODE="$2"; shift 2 ;;
+            --dir)      SEARCH_DIR="$2"; shift 2 ;;
+            --output)   OUTPUT_FILE="$2"; shift 2 ;;
+            --minimal)  MINIMAL=1; shift ;;
+            -h|--help)  usage ;;
+            *) echo "Error: Unknown argument '$1'" >&2; usage ;;
+        esac
+    done
+
+    [ -n "$MODE" ]       || { echo "Error: --mode required" >&2; usage; }
+    [ -n "$SEARCH_DIR" ] || { echo "Error: --dir required"  >&2; usage; }
+    [ -d "$SEARCH_DIR" ] || die "Search directory does not exist: $SEARCH_DIR"
+
+    case "$MODE" in name|content|both) ;; *) usage ;; esac
+}
+
+# =============================================================================
+#                              FIND HELPERS
+# =============================================================================
+
 # build_prune_args
-# Construct the find(1) prune expression from $EXCLUDE_DIRS. Echoes nothing
-# if the list is empty; callers should handle that case so find's expression
-# stays valid. The args are emitted one per line so the caller can read them
-# safely with `mapfile -t` regardless of whitespace in any entry.
-# -----------------------------------------------------------------------------
+# Echoes the find(1) prune expression for EXCLUDE_DIRS, one argument per
+# line. Empty if EXCLUDE_DIRS is empty. -iname is used so case differences
+# don't slip past the prune.
 build_prune_args() {
-    if [ ${#EXCLUDE_DIRS[@]} -eq 0 ]; then
-        return 0
-    fi
+    [ ${#EXCLUDE_DIRS[@]} -eq 0 ] && return 0
     local prune_paths=()
     local dir
     for dir in "${EXCLUDE_DIRS[@]}"; do
-        prune_paths+=(-o -name "$dir")
+        prune_paths+=(-o -iname "$dir")
     done
-    # Strip the leading -o, wrap in ( ... ) -prune.
-    local arg
     printf '%s\n' "("
+    local arg
     for arg in "${prune_paths[@]:1}"; do
         printf '%s\n' "$arg"
     done
@@ -125,247 +167,155 @@ build_prune_args() {
     printf '%s\n' "-prune"
 }
 
-# -----------------------------------------------------------------------------
-# search_by_name <SEARCH_DIR>
-# Find filesystem objects whose basename matches any NAME_SEARCH_PATTERNS
-# entry. Emits one CSV line per match to stdout.
-# -----------------------------------------------------------------------------
+# =============================================================================
+#                              MATCH ACCUMULATION
+# =============================================================================
+#
+# When a path matches, we append the matching pattern to either
+# MATCH_NAME_VALUES[$path] or MATCH_CONTENT_VALUES[$path]. At emit time we
+# combine these into a single CSV row per path.
+
+record_name_match() {
+    local path="$1" pattern="$2"
+    local cur="${MATCH_NAME_VALUES[$path]:-}"
+    if [ -z "$cur" ]; then
+        MATCH_NAME_VALUES["$path"]="$pattern"
+    elif [[ ",$cur," != *",$pattern,"* ]]; then
+        MATCH_NAME_VALUES["$path"]="${cur},${pattern}"
+    fi
+    [ -n "${MATCH_LSTAT_TS[$path]:-}" ] || MATCH_LSTAT_TS["$path"]="$(lstat_mtime_human "$path")"
+}
+
+record_content_match() {
+    local path="$1" pattern="$2"
+    local cur="${MATCH_CONTENT_VALUES[$path]:-}"
+    if [ -z "$cur" ]; then
+        MATCH_CONTENT_VALUES["$path"]="$pattern"
+    elif [[ ",$cur," != *",$pattern,"* ]]; then
+        MATCH_CONTENT_VALUES["$path"]="${cur},${pattern}"
+    fi
+    [ -n "${MATCH_LSTAT_TS[$path]:-}" ] || MATCH_LSTAT_TS["$path"]="$(lstat_mtime_human "$path")"
+}
+
+# =============================================================================
+#                              SEARCH PASSES
+# =============================================================================
+
 search_by_name() {
-    local search_dir="$1"
-    echo "Searching for names matching predefined patterns in '$search_dir' (case-insensitive, follows symlinks)..." >&2
+    info "Searching by name in $SEARCH_DIR"
 
     local find_prune_args=()
     mapfile -t find_prune_args < <(build_prune_args)
 
     local pattern path
     for pattern in "${NAME_SEARCH_PATTERNS[@]}"; do
-        # Use process substitution (not a pipe) so the loop body runs in this
-        # shell, not a subshell. Matches the pattern we settled on in
-        # migrator.sh; preserves any future state we might accumulate here.
         while IFS= read -r -d '' path; do
-            local is_excluded=false
-            local excluded
-            for excluded in "${EXCLUDE_DIRS[@]}"; do
-                if [[ $(basename "$path") == $excluded ]]; then
-                    is_excluded=true
-                    break
-                fi
-            done
-            if [ "$is_excluded" = true ]; then
-                continue
-            fi
-
-            local name absolute_path last_modified
-            name=$(basename "$path")
-            absolute_path=$(realpath "$path")
-            last_modified=$(stat -c %y "$path")
-            echo -ne "\033[2K\r" >&2
-            echo "\"$name\",\"$absolute_path\",\"Name\",\"$pattern\",\"$last_modified\""
-        done < <(find -L "$search_dir" "${find_prune_args[@]}" -o -iname "*$pattern*" -print0)
+            record_name_match "$(realpath "$path")" "$pattern"
+        done < <(find -L "$SEARCH_DIR" "${find_prune_args[@]}" -o -iname "*$pattern*" -print0)
     done
-    echo -ne "\033[2K\r" >&2
-    echo "Name search complete." >&2
+
+    info "Name search done"
 }
 
-# -----------------------------------------------------------------------------
-# search_by_content <SEARCH_DIR>
-# Find regular files whose content matches any CONTENT_SEARCH_PATTERNS entry,
-# skipping the file-name patterns in $CONTENT_SEARCH_EXCLUDE_FILES.
-# -----------------------------------------------------------------------------
 search_by_content() {
-    local search_dir="$1"
-    echo "Searching for content matching predefined patterns in '$search_dir' (case-insensitive)..." >&2
+    info "Searching by content in $SEARCH_DIR"
 
     local find_prune_args=()
     mapfile -t find_prune_args < <(build_prune_args)
 
     local find_file_exclude_args=()
-    if [ ${#CONTENT_SEARCH_EXCLUDE_FILES[@]} -gt 0 ]; then
-        local pattern
-        for pattern in "${CONTENT_SEARCH_EXCLUDE_FILES[@]}"; do
-            find_file_exclude_args+=(-not -iname "$pattern")
-        done
-    fi
-
-    local path
-    while IFS= read -r -d '' path; do
-        local is_excluded=false
-        local excluded
-        for excluded in "${EXCLUDE_DIRS[@]}"; do
-            if [[ $(basename "$path") == $excluded ]]; then
-                is_excluded=true
-                break
-            fi
-        done
-        if [ "$is_excluded" = true ]; then
-            continue
-        fi
-
-        echo -ne "Scanning: $path\r" >&2
-        local pattern
-        for pattern in "${CONTENT_SEARCH_PATTERNS[@]}"; do
-            if grep -I -i -q "$pattern" "$path" 2>/dev/null; then
-                local name absolute_path last_modified
-                name=$(basename "$path")
-                absolute_path=$(realpath "$path")
-                last_modified=$(stat -c %y "$path")
-                echo -ne "\033[2K\r" >&2
-                echo "\"$name\",\"$absolute_path\",\"Content\",\"$pattern\",\"$last_modified\""
-                break
-            fi
-        done
-    done < <(find -L "$search_dir" "${find_prune_args[@]}" -o -type f "${find_file_exclude_args[@]}" -print0)
-
-    echo -ne "\033[2K\r" >&2
-    echo "Content search complete." >&2
-}
-
-# -----------------------------------------------------------------------------
-# search_both <SEARCH_DIR>
-# Single-pass combined search: walk the tree once, evaluate every path against
-# both NAME_SEARCH_PATTERNS and CONTENT_SEARCH_PATTERNS. ~2x faster than
-# running name + content separately on large trees.
-# -----------------------------------------------------------------------------
-search_both() {
-    local search_dir="$1"
-    echo "Performing combined search for names and content in '$search_dir'..." >&2
-
-    local find_prune_args=()
-    mapfile -t find_prune_args < <(build_prune_args)
-
-    local path
-    while IFS= read -r -d '' path; do
-        local is_excluded=false
-        local excluded
-        for excluded in "${EXCLUDE_DIRS[@]}"; do
-            if [[ $(basename "$path") == $excluded ]]; then
-                is_excluded=true
-                break
-            fi
-        done
-        if [ "$is_excluded" = true ]; then
-            continue
-        fi
-
-        echo -ne "Scanning: $path\r" >&2
-        local name lower_name
-        name=$(basename "$path")
-        lower_name="${name,,}"
-
-        # --- Name pass ----------------------------------------------------
-        local pattern lower_pattern
-        for pattern in "${NAME_SEARCH_PATTERNS[@]}"; do
-            lower_pattern="*${pattern,,}*"
-            if [[ $lower_name == $lower_pattern ]]; then
-                local absolute_path last_modified
-                absolute_path=$(realpath "$path")
-                last_modified=$(stat -c %y "$path")
-                echo -ne "\033[2K\r" >&2
-                echo "\"$name\",\"$absolute_path\",\"Name\",\"$pattern\",\"$last_modified\""
-            fi
-        done
-
-        # --- Content pass (regular files only) ----------------------------
-        if [ -f "$path" ]; then
-            local should_exclude_file=false
-            if [ ${#CONTENT_SEARCH_EXCLUDE_FILES[@]} -gt 0 ]; then
-                local exclude_pattern
-                for exclude_pattern in "${CONTENT_SEARCH_EXCLUDE_FILES[@]}"; do
-                    if [[ $lower_name == ${exclude_pattern,,} ]]; then
-                        should_exclude_file=true
-                        break
-                    fi
-                done
-            fi
-
-            if [ "$should_exclude_file" = false ]; then
-                for pattern in "${CONTENT_SEARCH_PATTERNS[@]}"; do
-                    if grep -I -i -q "$pattern" "$path" 2>/dev/null; then
-                        local absolute_path last_modified
-                        absolute_path=$(realpath "$path")
-                        last_modified=$(stat -c %y "$path")
-                        echo -ne "\033[2K\r" >&2
-                        echo "\"$name\",\"$absolute_path\",\"Content\",\"$pattern\",\"$last_modified\""
-                        break
-                    fi
-                done
-            fi
-        fi
-    done < <(find -L "$search_dir" "${find_prune_args[@]}" -o -print0)
-
-    echo -ne "\033[2K\r" >&2
-    echo "Combined search complete." >&2
-}
-
-# =============================================================================
-#                                  Main Function
-# =============================================================================
-main() {
-    local mode=""
-    local search_dir=""
-    local output_file=""
-
-    if [ "$#" -eq 0 ]; then
-        usage
-    fi
-
-    while [ "$#" -gt 0 ]; do
-        case "$1" in
-            --mode)
-                mode="$2"
-                shift 2
-                ;;
-            --dir)
-                search_dir="$2"
-                shift 2
-                ;;
-            --output)
-                output_file="$2"
-                shift 2
-                ;;
-            *)
-                echo "Error: Unknown argument '$1'" >&2
-                usage
-                ;;
-        esac
+    local pattern
+    for pattern in "${CONTENT_SEARCH_EXCLUDE_FILES[@]}"; do
+        find_file_exclude_args+=(-not -iname "$pattern")
     done
 
-    if [ -z "$mode" ] || [ -z "$search_dir" ]; then
-        echo "Error: All primary arguments (--mode, --dir) are required." >&2
-        usage
-    fi
+    local path
+    while IFS= read -r -d '' path; do
+        for pattern in "${CONTENT_SEARCH_PATTERNS[@]}"; do
+            # grep -I: skip binary; -i: case-insensitive; -q: quiet.
+            if grep -I -i -q -F "$pattern" "$path" 2>/dev/null; then
+                record_content_match "$(realpath "$path")" "$pattern"
+            fi
+        done
+    done < <(find -L "$SEARCH_DIR" "${find_prune_args[@]}" -o -type f "${find_file_exclude_args[@]}" -print0)
 
-    if [ ! -d "$search_dir" ]; then
-        echo "Error: Search directory '$search_dir' not found." >&2
-        exit 1
-    fi
-
-    if [ -n "$output_file" ]; then
-        if ! touch "$output_file"; then
-            echo "Error: Cannot write to output file '$output_file'." >&2
-            exit 1
-        fi
-        exec > "$output_file"
-    fi
-
-    echo "Name,Absolute_Path,Match_Filter_Type,Filter_Value,Last_Modified"
-
-    case "$mode" in
-        name)
-            search_by_name "$search_dir"
-            ;;
-        content)
-            search_by_content "$search_dir"
-            ;;
-        both)
-            search_both "$search_dir"
-            ;;
-        *)
-            echo "Error: Invalid mode '$mode'. Use 'name', 'content', or 'both'." >&2
-            usage
-            ;;
-    esac
+    info "Content search done"
 }
 
-# --- Script Entry Point ------------------------------------------------------
-main "$@"
+# =============================================================================
+#                              OUTPUT EMITTER
+# =============================================================================
+#
+# Emits one CSV row per unique absolute path. The set of paths is the
+# UNION of MATCH_NAME_VALUES keys and MATCH_CONTENT_VALUES keys.
+
+emit_results() {
+    # Collect union of keys.
+    declare -A union
+    local p
+    for p in "${!MATCH_NAME_VALUES[@]}";    do union["$p"]=1; done
+    for p in "${!MATCH_CONTENT_VALUES[@]}"; do union["$p"]=1; done
+
+    # Header
+    if [ "$MINIMAL" -eq 1 ]; then
+        echo "Name,Absolute_Path,Last_Modified"
+    else
+        echo "Name,Absolute_Path,Match_Filter_Type,Filter_Value,Last_Modified"
+    fi
+
+    # Sort paths for deterministic output.
+    local sorted_paths
+    sorted_paths=$(printf '%s\n' "${!union[@]}" | sort)
+
+    while IFS= read -r p; do
+        [ -z "$p" ] && continue
+        local name; name=$(basename "$p")
+        local ts="${MATCH_LSTAT_TS[$p]}"
+        local nv="${MATCH_NAME_VALUES[$p]:-}"
+        local cv="${MATCH_CONTENT_VALUES[$p]:-}"
+
+        if [ "$MINIMAL" -eq 1 ]; then
+            printf '"%s","%s","%s"\n' "$name" "$p" "$ts"
+            continue
+        fi
+
+        local match_type filter_value
+        if [ -n "$nv" ] && [ -n "$cv" ]; then
+            match_type="Both"
+            filter_value="name:${nv};content:${cv}"
+        elif [ -n "$nv" ]; then
+            match_type="Name"
+            filter_value="$nv"
+        else
+            match_type="Content"
+            filter_value="$cv"
+        fi
+        printf '"%s","%s","%s","%s","%s"\n' \
+            "$name" "$p" "$match_type" "$filter_value" "$ts"
+    done <<< "$sorted_paths"
+}
+
+# =============================================================================
+#                                MAIN
+# =============================================================================
+
+main() {
+    parse_args "$@"
+
+    case "$MODE" in
+        name)    search_by_name ;;
+        content) search_by_content ;;
+        both)    search_by_name; search_by_content ;;
+    esac
+
+    if [ -n "$OUTPUT_FILE" ]; then
+        emit_results > "$OUTPUT_FILE"
+        info "Results written to: $OUTPUT_FILE"
+    else
+        emit_results
+    fi
+}
+
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi

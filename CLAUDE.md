@@ -4,115 +4,228 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-A small collection of standalone Bash utilities for an in-place data/path migration workflow on Linux servers (no Python, no package manager, no build system). Every script is self-contained and executed with `bash <script>.sh --mode <...>`.
+Bash utilities for a fat1 → fat2 dev-environment cloning workflow used as a DR exercise on a Linux host with **no sudo available**. The host has two unix accounts (fat1 user and fat2 user), each with read access to both trees but write access only to their own. `/tmp` is the only filesystem location both users can write to.
 
-The three production scripts in `bin/` form a loose pipeline; the three `setup_*_test.sh` scripts are companion harnesses that build mock environments and (for migrator) drive multi-phase validation.
+The whole suite assumes Linux + GNU coreutils + bash 4.2+. macOS will not run these scripts (`stat -c`, `touch -d "@epoch"` are GNU-only).
 
-`lib/` and `tests/{cases,fixtures,mocks}/` are placeholder directories — only `.gitkeep` files. There is no shared library or test runner yet; tests are bash harnesses invoked manually.
+## Flat layout
 
-## The pipeline (and a deliberate gap in it)
+All scripts live in `bin/`. There is no `bin/lib/` subdirectory because the operator deploys everything to a single working directory (`/tmp/migration_f2/` by convention). Sources resolve via `source "$(dirname "${BASH_SOURCE[0]}")/common.sh"` so any pair of scripts in the same directory composes.
 
+```text
+bin/
+├── common.sh                  ← shared library (sourced by everyone)
+├── finder.sh                  ← discover fat1-style references in a tree
+├── csv_reduce.sh              ← reduce finder's 5-col CSV to migrator's 3-col
+├── selective_copy.sh          ← two-stage cross-user copy via /tmp
+├── mock_build.sh              ← build a sandbox from a CSV (smart selective copy)
+├── migrator.sh                ← stateful path/content rewriter with backup/resume/rollback
+├── validate.sh                ← post-migration consistency checker
+├── setup_migrator_test.sh     ← orchestrator: mock_build → migrator → validate → rollback
+├── setup_finder_test.sh       ← (legacy) mock env for finder
+├── setup_linux_test.sh        ← (legacy) mock env for selective_copy
+├── diagnose_migrator_bug.sh   ← (legacy) read-only diagnostic; useful if a new bug appears
+└── run_all_tests.sh           ← synthetic end-to-end smoke; no fat1/fat2 dependency
 ```
-finder.sh  →  (manual CSV reduction)  →  migrator.sh  →  selective_copy.sh
-  (discover)         (operator)          (mutate +     (cross-user
-                                          rollback)     deploy, no sudo)
+
+`lib/` and `tests/{fixtures,mocks}/` are now unused placeholders. `tests/cases/fat2.csv` is the real input CSV used during development and as the canonical example.
+
+## The two pipelines
+
+### Production pipeline (live DR migration)
+
+```text
+  fat1 tree  (/applications/opc_d1)
+       │
+       │  (as fat1 user)
+       ▼
+  selective_copy.sh --mode prepare       ← stages into /tmp/scopy.XXXX
+       │
+       │  (as fat2 user)
+       ▼
+  selective_copy.sh --mode deploy        ← writes fat2 tree, restores lstat
+       │
+       ▼
+  fat2 tree  (/applications/opc_d2, identical to fat1 at this point)
+       │
+       │  (as fat2 user)
+       ▼
+  finder.sh --mode both --dir /applications/opc_d2 --minimal
+       │
+       ▼
+  fat2.csv   (3-col: Name, Absolute_Path, Last_Modified)
+       │
+       │  optional: hand-edit, or pipe through csv_reduce.sh if 5-col
+       ▼
+  migrator.sh --mode execute
+              --root /applications/opc_d2
+              --csv fat2.csv
+              --workdir /tmp/migration_f2
+              --yes                       ← + 5s countdown gate
+       │
+       ▼
+  fat2 tree now has fat1-references rewritten to fat2 equivalents,
+  lstat (especially mtime) preserved row-for-row.
+       │
+       ▼
+  validate.sh --root /applications/opc_d2
+              --workdir /tmp/migration_f2
+              --scan-root /applications/opc_d2
 ```
 
-**Important schema mismatch:** [bin/finder.sh](bin/finder.sh) emits a **5-column** CSV — `Name,Absolute_Path,Match_Filter_Type,Filter_Value,Last_Modified`. [bin/migrator.sh](bin/migrator.sh) reads a **3-column** CSV — `Name,Absolute_Path,Last_Modified`. Finder output is **not** fed directly into migrator; there is an implicit operator step to reduce columns 3–4 out. [bin/setup_migrator_test.sh](bin/setup_migrator_test.sh) generates its own 3-column CSV for testing and never invokes finder. Treat the CSV contract as belonging to migrator; finder's extra columns are diagnostic.
+`selective_copy.sh` was already used in this DR (the operator confirmed it ran successfully). The remaining steps run on the fat2 side. fat1 is read-only from here on.
 
-## What each script does
+### Mock test pipeline (rehearsal without touching fat2)
 
-### [bin/finder.sh](bin/finder.sh) — read-only discovery
-Walks a tree (`-L`, case-insensitive) matching basenames against `NAME_SEARCH_PATTERNS` and/or file contents against `CONTENT_SEARCH_PATTERNS`. Three modes: `name`, `content`, `both`. `both` is a single-pass combined walk (~2x faster than running the other two sequentially). Skips directories named in `EXCLUDE_DIRS` and (for content) files matching `CONTENT_SEARCH_EXCLUDE_FILES`. Progress prints to stderr; CSV results to stdout (or `--output`).
+```text
+  fat2.csv  (e.g. tests/cases/fat2.csv)
+       │
+       ▼
+  mock_build.sh --csv fat2.csv
+                --source-root /applications/opc_d2
+                --mock-root /tmp/mock_f2
+       │
+       ▼
+  /tmp/mock_f2/applications/opc_d2/...   ← real-fidelity copies of CSV-listed paths
+  /tmp/mock_f2/mock_input.csv             ← CSV with paths under /tmp/mock_f2/
+       │
+       ▼
+  migrator.sh --mode execute
+              --root /tmp/mock_f2
+              --csv /tmp/mock_f2/mock_input.csv
+              --workdir /tmp/migration_f2_test
+       │              ← /tmp/* root is "mock"; no countdown, no --yes needed
+       ▼
+  validate.sh --root /tmp/mock_f2 --workdir /tmp/migration_f2_test
+              --scan-root /tmp/mock_f2
+       │
+       ▼
+  migrator.sh --mode rollback ...        ← restores mock from backups
+              (then re-validate: mock now matches what was copied from live)
+       │
+       ▼
+  migrator.sh --mode cleanup ...         ← deletes backups + tracking
+  rm -rf /tmp/mock_f2                     ← deletes the mock tree
+```
 
-### [bin/migrator.sh](bin/migrator.sh) — stateful in-place mutator
-Three modes:
-- `execute` — for each CSV row: back up to `/tmp/migrator_backups_<ts>/`, rename the path per `PATH_REPLACE_MAPPING`, rewrite file contents per `CONTENT_REPLACE_MAPPING` (or retarget symlinks), then restore the original mtime. Each step is logged to `migration_progress.log` as `BACKED_UP` → `COMPLETED`. Re-runs **resume**: previously `COMPLETED` paths are skipped.
-- `rollback` — replays `migration_progress.log` in reverse, restoring each path from its backup.
-- `cleanup` — deletes the backup files referenced in the tracking log, then `rmdir`s the backup directory if empty.
+`bin/setup_migrator_test.sh` orchestrates all of this via `--mode all`. `bin/run_all_tests.sh` does the same against a synthetic tree it builds itself (no fat1/fat2 dependency) — run this on any Linux box to smoke-test changes before deploying.
 
-Forward and reverse mappings are both declared at the top of the file because `setup_migrator_test.sh validate_integrity` sources this script to access `REVERSE_*_MAPPING` and `replace_content_in_file`. **The `main "$@"` call at the bottom is intentionally guarded with `[[ "${BASH_SOURCE[0]}" == "${0}" ]]` — do not remove this guard, or sourcing will execute migrator's main with the caller's argv.**
+## The four hard requirements (and how they're satisfied)
 
-### [bin/selective_copy.sh](bin/selective_copy.sh) — two-stage cross-user copy
-Designed for environments with **split user permissions and no sudo**. User A (read-side, e.g. `xbapp_d1`) runs `--mode prepare`, which rsyncs files + symlinks into a shared `/tmp/selective_copy_stage/`, records original perms/mtimes in `permissions.state`, and chmods the staging area open. User B (write-side, e.g. `xbapp_d2`) runs `--mode deploy`, which rsyncs staging → `TARGET_BASE_DIR`, creates the configured symlinks at their **new** targets, applies `NESTED_ITEM_TRANSFORM` renames/retargets, and restores perms+mtimes from `permissions.state`.
+These come from the DR brief; each script must respect them.
 
-Refuses to run as root by design — running as root would defeat the split-permission model the script is built for.
+| Requirement | Implementation |
+| --- | --- |
+| **Backup before every change** | `migrator.sh` uses `cp -a` per row before any mutation. Backup tree mirrors original tree shape under `<workdir>/backups/` — no basename collisions possible. `selective_copy.sh` stages via rsync into `mktemp -d` and records lstat for restore. |
+| **Validate that the change happened** | `validate.sh` reads migrator's tracking file. For every COMPLETED row, checks: migrated path exists, backup exists, mtime matches recorded ts, lstat type matches backup, content equals expected rewrite of backup, symlink target matches expected. Tree-wide `--scan-root` looks for residual fat1 references. |
+| **Resume after mid-run kill** | Tracking file is append-only at `<workdir>/progress.log`. On restart, every `BACKED_UP`-but-not-`COMPLETED` row triggers restore-from-backup followed by re-execute. Backup is the source of truth; live path may be in any intermediate state. Re-running migrator with the same `--workdir` resumes automatically. |
+| **Rollback even after success** | `migrator.sh --mode rollback` walks tracking in reverse, restores each `COMPLETED` row from its backup, restores its mtime, appends `ROLLED_BACK` to tracking. `--mode cleanup` deletes backups + tracking. Mock pipeline includes a `validate-rollback` phase that diffs the rolled-back mock against the original source — bit-for-bit equivalence is the gate. |
 
-## Configuration model
+## /tmp constraint
 
-All three scripts are **configuration-as-code**: search patterns, replacement mappings, base paths, and exclusion lists are declared as `readonly` arrays/maps at the top of each script. There are no config files and no CLI flags for these values. To change what gets searched, migrated, or copied, **edit the constants in the script file itself**. The current values (`fat1`→`fat2`, `opc_d1`→`opc_d2`, `xbapp_d1`→`xbapp_d2`, etc.) reflect a specific environment migration; treat them as user-supplied data, not as canonical.
+The operator confirmed: `/tmp` is the only writable shared location. There is no `/var/tmp`, no `$HOME` option, no shared mount. So:
+
+- `migrator.sh`'s `--workdir` defaults to `/tmp/migration_f2/` (configurable).
+- `mock_build.sh`'s `--mock-root` defaults to `/tmp/mock_f2/`.
+- `selective_copy.sh` creates a `mktemp -d /tmp/scopy.XXXXXX` staging dir.
+- `common.sh:check_tmpfs_warning` warns loudly if the chosen dir is tmpfs (sweepers and reboot will lose backups).
+- **Recommended operator practice**: run the full forward + validate + decision-to-keep cycle in one continuous shell session. Don't let a tmpfiles.d sweeper or a reboot get between execute and validate.
+
+## --root safety guard
+
+`migrator.sh` REQUIRES `--root`. Every CSV path is asserted to be under `--root` (`assert_under_root` in common.sh). A stray fat1 path in the CSV would `die` before any mutation. This is the load-bearing defense against the failure mode the operator called out as expensive: "messing up the precopied fat2 can lead to tremendous delays".
+
+A root starting with `/tmp/` is treated as mock — no `--yes` required, no countdown. A non-`/tmp` root requires `--yes` and shows a 5-second countdown abortable with Ctrl-C. Test harnesses set `NONINTERACTIVE=1` to skip the countdown silently.
+
+## Resume model in detail
+
+The previous tracking model only had BACKED_UP → COMPLETED. If killed between `mv` and the COMPLETED write, the row's state was unrecoverable — re-running would either re-backup the mutated state (destroying the original) or skip the row leaving partial state.
+
+New model: tracking is append-only. The LATEST status for a given Original_Path wins.
+
+- `BACKED_UP`: backup exists, mutation may or may not have started.
+- `COMPLETED`: row is fully done (mutated + mtime restored + logged).
+- `ROLLED_BACK`: row has been restored from backup.
+
+On `--mode execute` startup, `tracking_latest_status_for` is checked per row:
+
+- `COMPLETED` → skip
+- `BACKED_UP` → restore-from-backup, then redo (idempotent because backup is source of truth)
+- `ROLLED_BACK` or absent → fresh
+
+This makes resume safe regardless of when the kill happened. The only invariant needed is backup-file integrity.
+
+## Configuration-as-code (intentional)
+
+`MIGRATION_MAP` in `migrator.sh` is the single source of truth for forward mappings (`fat1 → fat2`, `opc_d1 → opc_d2`, etc.). The reverse map is derived at runtime via `derive_reverse_map` in common.sh — no duplicate-and-drift.
+
+`finder.sh` sources `migrator.sh` to get the same `MIGRATION_MAP`. Its `NAME_SEARCH_PATTERNS` and `CONTENT_SEARCH_PATTERNS` are just `"${!MIGRATION_MAP[@]}"`. Anything finder finds is something migrator can rewrite, by construction.
+
+Adding a new pattern is a single edit to `MIGRATION_MAP`. The map is `declare -Ar` (associative + readonly). Note: `declare -A readonly NAME=(...)` is a latent bug (bash parses `readonly` as a separate identifier and `NAME` is NOT actually readonly). The `-Ar` form is the correct shorthand and is documented inline.
+
+## Bash 4.2 idioms to preserve
+
+The host runs bash 4.2.46 (RHEL 7 era). Namerefs (`declare -n`) require 4.3+, so they cannot be used. `common.sh` uses **`eval`-based associative-array indirection** in three helpers — `derive_reverse_map`, `apply_path_mapping`, `replace_content_in_file`. The eval'd arguments are array names from trusted source files (no user input), so the usual injection concerns don't apply. Don't "modernize" this without bumping the version floor and updating `require_bash_version` calls.
+
+## Shell hygiene patterns (don't drop these when editing)
+
+- **`set -euo pipefail`** in every executable script, set after `source common.sh`.
+- **`require_bash_version`** check up front. Fail at startup with a clear message rather than mysteriously deep in the run.
+- **`local count=$((count + 1))`** instead of `((count++))` — the latter returns exit 1 on the first call and is killed by `set -e`.
+- **Process substitution** `done < <(find ... -print0)` instead of `find ... | while read` — pipes run the while loop in a subshell and silently drop any state set inside.
+- **`grep -v ... || true`** when filtering tracking files. If every line matches, grep exits 1 and pipefail kills the script — the `|| true` is load-bearing.
+- **`if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi`** at the bottom of every executable script so other scripts can source it without firing `main`. `finder.sh` and `validate.sh` source `migrator.sh` to access `MIGRATION_MAP` and `backup_path_for`.
+- **`replace_content_in_file`** in common.sh writes via `cat tmp > file`, not `mv tmp file`. This preserves the original inode's perms/owner/ACL/timestamps. mtime is bumped (and must be restored by the caller from the recorded original).
+- **Backup directory mirrors the original tree shape**, not basename + epoch. Collisions are impossible regardless of name overlap and rollback is structural rather than tracking-dependent.
 
 ## Running
 
 ```bash
-# Discover candidates
-bash bin/finder.sh --mode both --dir /path/to/root --output found.csv
+# --- LOCAL SMOKE TEST (any Linux box, no fat1/fat2 needed) ---
+bash bin/run_all_tests.sh
 
-# Reduce finder's 5-col CSV to migrator's 3-col CSV (operator step — no tool yet)
-# Keep columns: Name, Absolute_Path, Last_Modified  (columns 1, 2, 5)
+# --- MOCK REHEARSAL on the real host (touches /tmp only) ---
+bash bin/setup_migrator_test.sh --mode all \
+    --csv tests/cases/fat2.csv \
+    --source-root /applications/opc_d2
 
-# Apply migration (resumable; safe to re-run)
-bash bin/migrator.sh --mode execute --csv reduced.csv
+# --- INDIVIDUAL PHASES ---
+bash bin/mock_build.sh --csv tests/cases/fat2.csv \
+                       --source-root /applications/opc_d2 \
+                       --mock-root /tmp/mock_f2
+bash bin/migrator.sh --mode execute \
+                     --root /tmp/mock_f2 \
+                     --csv /tmp/mock_f2/mock_input.csv \
+                     --workdir /tmp/migration_f2_test
+bash bin/validate.sh --root /tmp/mock_f2 --workdir /tmp/migration_f2_test \
+                     --scan-root /tmp/mock_f2
 
-# Revert
-bash bin/migrator.sh --mode rollback
+# --- LIVE MIGRATION (the real thing) ---
+bash bin/migrator.sh --mode execute \
+                     --root /applications/opc_d2 \
+                     --csv tests/cases/fat2.csv \
+                     --workdir /tmp/migration_f2 \
+                     --yes               # countdown follows
 
-# Delete backups after validation
-bash bin/migrator.sh --mode cleanup
+# --- ROLLBACK (works for failed OR successful runs) ---
+bash bin/migrator.sh --mode rollback \
+                     --root /applications/opc_d2 \
+                     --workdir /tmp/migration_f2 \
+                     --yes
 
-# Cross-user copy (run prepare as source-user, deploy as target-user)
-bash bin/selective_copy.sh --mode prepare    # as user A
-bash bin/selective_copy.sh --mode deploy     # as user B
+# --- CLEANUP (deletes backups + tracking) ---
+bash bin/migrator.sh --mode cleanup \
+                     --root /applications/opc_d2 \
+                     --workdir /tmp/migration_f2
 ```
 
-## Testing
+## Legacy / wind-down
 
-There is no test runner. The `setup_*_test.sh` scripts build mock filesystem environments under `/tmp/` and either run assertions directly (migrator) or print operator instructions (finder, selective_copy).
+- **`bin/setup_finder_test.sh`** and **`bin/setup_linux_test.sh`** still exist but pre-date the lib refactor. They print operator instructions rather than running tests. Replace or delete on a future pass.
+- **`bin/diagnose_migrator_bug.sh`** was built to diagnose a specific harness bug (now fixed: `cp -a` is checked, `[ -d ]` has the `[ ! -L ]` guard). It remains useful as a forensic tool if a new harness bug appears, but the bug it was built for is no longer reachable in the rewritten orchestrator.
+- **`docs/DIAGNOSE_WORKFLOW.md`** describes the remote-operator runbook for the old diagnostic. Useful as a template if another remote-diagnose situation arises, but not part of the active workflow.
 
-```bash
-# Finder: builds /tmp/finder_test/ with case-mixed names + a symlink, then prints
-# the exact finder.sh commands to run and their expected output.
-bash bin/setup_finder_test.sh
-
-# Migrator: full multi-phase harness. Takes a real CSV, replicates the listed
-# files into /tmp/test_f2/migration_test/environment_to_migrate/, then runs
-# migrator against the mock and validates results.
-bash bin/setup_migrator_test.sh --mode all --csv real_input.csv
-
-# Individual phases:
-bash bin/setup_migrator_test.sh --mode prepare --csv real_input.csv
-bash bin/setup_migrator_test.sh --mode execute
-bash bin/setup_migrator_test.sh --mode validate              # path/content/mtime checks
-bash bin/setup_migrator_test.sh --mode rollback              # rollback + auto-diff vs originals
-bash bin/setup_migrator_test.sh --mode cleanup               # verifies backup dir removed
-bash bin/setup_migrator_test.sh --mode validate_integrity    # round-trip: apply REVERSE_* mappings and diff against backups
-
-# Selective copy: builds a complex mock source tree, then prints sed commands to
-# rewrite selective_copy.sh's hardcoded paths/mappings for the test.
-bash bin/setup_linux_test.sh
-```
-
-`validate_integrity` is the strongest correctness check: it copies each migrated artefact, applies the reverse mappings, and diffs against the original backup. Any divergence means the forward transformation was lossy.
-
-## Platform and Bash version constraints
-
-- **Linux-only by default.** Scripts use GNU coreutils flags directly: `stat -c %y`, `touch -d "@epoch"`, `touch -h -d "$timestamp"`. None of these work on stock macOS BSD coreutils. Migrator does detect `tac` vs `tail -r` for log reversal, but the `stat`/`touch` calls are not gated.
-- **Bash version floors enforced at startup:** finder requires 4.0+ (uses `${var,,}` case-folding), migrator requires 4.2+ (uses `declare -Ar` and eval-based array indirection because `declare -n` namerefs need 4.3+).
-- All scripts run under `set -euo pipefail`. Several non-obvious patterns in the code exist specifically to survive this discipline — see "Conventions to preserve" below.
-
-## Conventions to preserve when editing
-
-These show up across files and have inline comments explaining why; respect them when modifying:
-
-- **Process substitution, not pipes, around `while read` loops.** `find ... -print0 | while read ...` runs the loop body in a subshell and silently loses any state set inside. Both finder and migrator use `done < <(find ... -print0)` for this reason.
-- **Arithmetic assignment, not `((count++))`.** `((count++))` evaluates to the *old* value (0 on first call), returns exit-status 1, and is killed by `set -e`. Use `count=$((count + 1))`. Called out explicitly in [bin/setup_migrator_test.sh](bin/setup_migrator_test.sh) `validate_log`.
-- **`grep -v ... || true`** when filtering tracking files. If every line matches, grep exits 1 and `pipefail` kills the script — the `|| true` is load-bearing, not paranoia.
-- **`declare -Ar NAME=(...)`**, never `declare -A readonly NAME=(...)`. The second form is a latent bug — bash parses `readonly` as a separate identifier and `NAME` is not actually readonly. The comment above the mappings in [bin/migrator.sh](bin/migrator.sh) documents this.
-- **`eval` for named-array indirection** in `replace_content_in_file` is intentional — bash 4.2 has no namerefs. Don't "modernize" it to `declare -n` without bumping the version floor and updating the version check.
-- **Sourcing guard at the bottom of migrator.sh** (`if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi`) is required by `setup_migrator_test.sh`'s `validate_integrity` mode. Removing it breaks the round-trip test.
-- **`if ! main "$@"; then ...`** at the bottom of selective_copy.sh disables `set -e` for the main invocation so the FATAL handler can run. Don't replace it with a bare `main "$@"`.
-
-## Author conventions (from global directives)
+## Author conventions
 
 - Commits: no `Co-Authored-By: Claude` trailer. Author is Abhijit Bandyopadhyay <abhijitb@gmail.com>.
-- Commit style: `<type>: <description>` with types `feat|fix|docs|refactor|test|chore`.
+- Commit message style: `<type>: <description>` — `feat | fix | docs | refactor | test | chore`.
