@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*~
+
+# Local docs — kept out of public repo
+docs/
+
+# Test artifacts
+*.log
+
+# Local env
+.env
+.env.local
