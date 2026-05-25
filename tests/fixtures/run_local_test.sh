@@ -120,6 +120,7 @@ init_paths() {
     CSV_FILE="${TEST_BASE}/fixture_input.csv"
     MOPC="${MOCK_ROOT}${OPC}"
 
+    mkdir -p "${TEST_BASE}"
     export LOG_FILE="${TEST_BASE}/run_local_test.log"
 }
 
