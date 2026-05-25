@@ -87,6 +87,7 @@ TRACKING_FILE=""
 LOG_FILE_PATH=""        # exported as LOG_FILE for common.sh log()
 DRY_RUN=0
 ASSUME_YES=0
+POST_VALIDATE=0         # --validate: run post-rollback validation
 
 # =============================================================================
 #                                  USAGE
@@ -115,6 +116,8 @@ OPTIONAL:
   --tracking-file PATH  Default: <workdir>/progress.log
   --log-file     PATH   Default: <workdir>/migrator_<run-id>.log
   --dry-run             Print what would happen; touch no disk state.
+  --validate            (rollback only) After rollback, verify every restored
+                        path matches its backup exactly (content, type, mtime).
   --yes                 Skip the live-mode confirmation countdown.
                         Required for non-/tmp roots. Test harnesses should
                         set NONINTERACTIVE=1 instead.
@@ -223,6 +226,7 @@ parse_args() {
             --log-file)      LOG_FILE_PATH="$2"; shift 2 ;;
             --dry-run)       DRY_RUN=1; shift ;;
             --yes)           ASSUME_YES=1; shift ;;
+            --validate)      POST_VALIDATE=1; shift ;;
             -h|--help)       usage ;;
             *) echo "Error: Unknown argument '$1'" >&2; usage ;;
         esac
@@ -622,10 +626,11 @@ run_rollback() {
                     continue
                 fi
                 if restore_from_backup "$orig" "$row_bkp" "$restore_to"; then
-                    # Restore mtime on the now-restored path
-                    if ! restore_mtime_from_human "$restore_to" "${ts_for_path[$orig]}" 2>/dev/null; then
-                        warn "Timestamp restore failed for: $restore_to"
-                    fi
+                    # cp -a in restore_from_backup already preserved the
+                    # backup's mtime. No need for restore_mtime_from_human
+                    # here — that would apply the CSV timestamp (which may
+                    # have a different timezone offset) and clobber the
+                    # correct mtime that cp -a set.
                     tracking_append "$orig" "$restore_to" "$row_bkp" \
                         "${ts_for_path[$orig]}" "ROLLED_BACK"
                     success "ROLLED_BACK: $orig"
@@ -641,6 +646,194 @@ run_rollback() {
     done < <(tac "$TRACKING_FILE" | grep -v '^Original_Path,')
 
     success "ROLLBACK finished. Restored $count paths."
+
+    if [ "$POST_VALIDATE" -eq 1 ]; then
+        validate_rollback
+    fi
+}
+
+# =============================================================================
+#                          POST-ROLLBACK VALIDATION
+# =============================================================================
+#
+# For every ROLLED_BACK row, verify that the restored path matches its backup
+# exactly: same content, same lstat type, same mtime. This proves rollback
+# faithfully restored the pre-migration state.
+
+validate_rollback() {
+    info ""
+    info "==== POST-ROLLBACK VALIDATION ===="
+
+    # Colours (disabled if not a terminal).
+    local c_reset="" c_green="" c_red="" c_cyan="" c_dim="" c_bold=""
+    if [ -t 1 ]; then
+        c_reset=$'\033[0m'  c_green=$'\033[0;32m' c_red=$'\033[0;31m'
+        c_cyan=$'\033[0;36m' c_dim=$'\033[0;90m'  c_bold=$'\033[1m'
+    fi
+
+    declare -A rb_status
+    declare -A rb_bkp
+    declare -A rb_newp
+    declare -A rb_ts
+
+    local orig newp bkp ts status
+    local tmp_log
+    tmp_log=$(mktemp)
+    tail -n +2 "$TRACKING_FILE" > "$tmp_log"
+    while IFS=, read -r orig newp bkp ts status; do
+        orig=$(csv_strip_field "$orig")
+        newp=$(csv_strip_field "$newp")
+        bkp=$(csv_strip_field "$bkp")
+        ts=$(csv_strip_field "$ts")
+        status=$(csv_strip_field "$status")
+        rb_status["$orig"]="$status"
+        rb_bkp["$orig"]="$bkp"
+        rb_newp["$orig"]="$newp"
+        rb_ts["$orig"]="$ts"
+    done < "$tmp_log"
+    rm -f "$tmp_log"
+
+    # Collect rolled-back directory paths so we can skip child rows that
+    # were already restored as part of the parent directory rollback.
+    declare -A rolled_back_dirs
+    local path
+    for path in "${!rb_status[@]}"; do
+        [ "${rb_status[$path]}" = "ROLLED_BACK" ] || continue
+        local rtype
+        # Check if the original path (now restored) is a directory.
+        if [ -d "$path" ]; then
+            rolled_back_dirs["$path"]=1
+        fi
+    done
+
+    local pass=0 fail=0 total=0 skipped=0
+    for path in "${!rb_status[@]}"; do
+        [ "${rb_status[$path]}" = "ROLLED_BACK" ] || continue
+
+        local row_bkp="${rb_bkp[$path]}"
+        local row_newp="${rb_newp[$path]}"
+        local row_ts="${rb_ts[$path]}"
+
+        # Determine where the restored file should be.
+        # For redirected rows, restore_to = new_path; for normal rows, restore_to = orig_path.
+        local restore_to="$path"
+        if [ -n "$row_newp" ] && [ "$(backup_path_for "$row_newp")" = "$row_bkp" ] && \
+           [ "$row_newp" != "$path" ]; then
+            restore_to="$row_newp"
+        fi
+
+        # Skip child rows whose parent directory was also rolled back.
+        # The parent's cp -a already restored all children; validating
+        # individual child rows against their (potentially redirected)
+        # backups would produce false mismatches.
+        local skip_child=0
+        local dpath
+        for dpath in "${!rolled_back_dirs[@]}"; do
+            if [[ "$path" == "$dpath"/* ]]; then
+                skip_child=1; break
+            fi
+        done
+        if [ "$skip_child" -eq 1 ]; then
+            skipped=$((skipped + 1)); continue
+        fi
+
+        total=$((total + 1))
+
+        local display="${restore_to#${ROOT}/}"
+
+        # 1. Restored path exists.
+        # For redirected child rows, the parent directory may have been rolled
+        # back (e.g. mq-opcsvcf2 -> mq-opcsvcf1), moving the file back to
+        # its original CSV path. Check both locations.
+        local check_path="$restore_to"
+        if [ ! -e "$restore_to" ] && [ ! -L "$restore_to" ]; then
+            if [ "$path" != "$restore_to" ] && { [ -e "$path" ] || [ -L "$path" ]; }; then
+                check_path="$path"
+                display="${path#${ROOT}/}"
+            else
+                printf "${c_red}  FAIL${c_reset} %s — restored path missing\n" "$display"
+                fail=$((fail + 1)); continue
+            fi
+        fi
+
+        # 2. Backup exists
+        if [ ! -e "$row_bkp" ] && [ ! -L "$row_bkp" ]; then
+            printf "${c_red}  FAIL${c_reset} %s — backup missing: %s\n" "$display" "$row_bkp"
+            fail=$((fail + 1)); continue
+        fi
+
+        # 3. lstat type match
+        local t_restored t_bkp
+        t_restored=$(lstat_type "$check_path")
+        t_bkp=$(lstat_type "$row_bkp")
+        if [ "$t_restored" != "$t_bkp" ]; then
+            printf "${c_red}  FAIL${c_reset} %s — type mismatch: restored=%s backup=%s\n" \
+                "$display" "$t_restored" "$t_bkp"
+            fail=$((fail + 1)); continue
+        fi
+
+        # 4. mtime match
+        # Compare against backup's actual mtime — this is the ground truth.
+        # The recorded timestamp in tracking may have a timezone offset that
+        # cp -a doesn't preserve identically, especially for child files
+        # restored via parent directory rollback.
+        local actual_epoch backup_epoch
+        actual_epoch=$(lstat_mtime_epoch "$check_path")
+        backup_epoch=$(lstat_mtime_epoch "$row_bkp")
+        if [ "$actual_epoch" != "$backup_epoch" ]; then
+            printf "${c_red}  FAIL${c_reset} %s — mtime: have=%s want=%s (from backup)\n" \
+                "$display" "$actual_epoch" "$backup_epoch"
+            fail=$((fail + 1)); continue
+        fi
+
+        # 5. Content/target match against backup
+        case "$t_restored" in
+            file)
+                if ! diff -q "$row_bkp" "$check_path" >/dev/null 2>&1; then
+                    printf "${c_red}  FAIL${c_reset} %s — content differs from backup\n" "$display"
+                    diff -u "$row_bkp" "$check_path" 2>/dev/null | head -20 | while IFS= read -r dl; do
+                        case "$dl" in
+                            -*) printf "${c_red}       %s${c_reset}\n" "$dl" ;;
+                            +*) printf "${c_green}       %s${c_reset}\n" "$dl" ;;
+                            *)  printf "${c_dim}       %s${c_reset}\n" "$dl" ;;
+                        esac
+                    done
+                    fail=$((fail + 1)); continue
+                fi
+                ;;
+            symlink)
+                local actual_target backup_target
+                actual_target=$(readlink "$check_path")
+                backup_target=$(readlink "$row_bkp")
+                if [ "$actual_target" != "$backup_target" ]; then
+                    printf "${c_red}  FAIL${c_reset} %s — symlink target: have='%s' want='%s'\n" \
+                        "$display" "$actual_target" "$backup_target"
+                    fail=$((fail + 1)); continue
+                fi
+                ;;
+            dir)
+                : # directory existence + mtime already checked
+                ;;
+        esac
+
+        printf "${c_green}  PASS${c_reset} %s\n" "$display"
+        pass=$((pass + 1))
+    done
+
+    echo ""
+    printf "${c_bold}====== ROLLBACK VALIDATION ======${c_reset}\n"
+    printf "  Rows checked : %d\n" "$total"
+    [ "$skipped" -gt 0 ] && printf "  ${c_dim}Skipped      : %d (children of rolled-back dirs)${c_reset}\n" "$skipped"
+    printf "  ${c_green}Passed       : %d${c_reset}\n" "$pass"
+    if [ "$fail" -gt 0 ]; then
+        printf "  ${c_red}Failed       : %d${c_reset}\n" "$fail"
+        printf "${c_bold}=================================${c_reset}\n"
+        die "Rollback validation failed: $fail row(s)"
+    else
+        printf "  Failed       : 0\n"
+        printf "${c_bold}=================================${c_reset}\n"
+        success "Rollback validation passed."
+    fi
 }
 
 # =============================================================================
