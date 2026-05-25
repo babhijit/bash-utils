@@ -2,59 +2,43 @@
   FAT1 -> FAT2 MIGRATION RUNBOOK
 ================================================================================
 
-  Host prerequisites:
-    - Linux with GNU coreutils
-    - bash >= 4.2
-    - Write access to /applications/opc_d2 (fat2 tree)
-    - Write access to /tmp
-    - All scripts deployed to a single directory (e.g. /tmp/migration_f2/bin/)
+  Prerequisites:
+    - Linux, GNU coreutils, bash >= 4.2
+    - Write access to /applications/opc_d2 and /tmp
+    - Scripts deployed to a single directory on the host
+    - Input CSV: fat2.csv (3-column: Name, Absolute_Path, Last_Modified)
 
-  CSV:
-    - tests/cases/fat2.csv (3-column: Name, Absolute_Path, Last_Modified)
-    - This is the source of truth for what gets migrated.
+  MIGRATION_MAP (what gets rewritten — names AND content):
+    FAT1 -> FAT2    fat1 -> fat2    opc_d1 -> opc_d2
+    xbapp_d1 -> xbapp_d2            opcsvcf1 -> opcsvcf2
 
-  MIGRATION_MAP (what gets rewritten):
-    FAT1      -> FAT2
-    fat1      -> fat2
-    opc_d1    -> opc_d2
-    xbapp_d1  -> xbapp_d2
-    opcsvcf1  -> opcsvcf2
+  Edge cases handled:
+    - Target already exists (fat2_X alongside fat1_X): processes fat2_X
+      directly, leaves fat1_X alone
+    - Only fat2_X exists (no fat1_X): processes fat2_X content
+    - Symlinks: target rewritten, symlink renamed, mtime preserved
+
 
 ================================================================================
-  RUN 1: MOCK REHEARSAL (touches /tmp only, zero risk to live tree)
+  RUN 1: MOCK REHEARSAL  (touches /tmp only — zero risk to live)
 ================================================================================
 
-  Purpose:
-    High-fidelity dry run using real files copied from the live tree.
-    Exercises the full pipeline: build mock -> execute -> validate -> rollback.
-    If this passes, the scripts are verified against your actual data.
+  Purpose: prove the scripts work against your real data before touching live.
 
-  Step 1 — Build the mock tree
-  ──────────────────────────────
+  Step 1 — Build mock
+  ────────────────────
 
     bash bin/mock_build.sh \
-        --csv tests/cases/fat2.csv \
+        --csv fat2.csv \
         --source-root /applications/opc_d2 \
         --mock-root /tmp/mock_f2 \
         --reset
 
-    What it does:
-      - Reads each path from the CSV
-      - Copies it from /applications/opc_d2 into /tmp/mock_f2/applications/opc_d2/...
-      - Preserves lstat (permissions, timestamps, symlinks) via cp -a
-      - Writes /tmp/mock_f2/mock_input.csv with paths pointing into the mock
+    Check: "failed: 0". Skipped/missing counts are expected.
+    Output: /tmp/mock_f2/mock_input.csv
 
-    What to check:
-      - "copied: N" with N matching your CSV row count (minus duplicates)
-      - "failed: 0"
-      - "skipped: M" is fine (files inside directories already copied)
-
-    Output:
-      /tmp/mock_f2/applications/opc_d2/...   <- copy of listed paths
-      /tmp/mock_f2/mock_input.csv            <- CSV for migrator
-
-  Step 2 — Execute migration on mock
-  ────────────────────────────────────
+  Step 2 — Execute on mock
+  ─────────────────────────
 
     bash bin/migrator.sh \
         --mode execute \
@@ -62,79 +46,28 @@
         --csv /tmp/mock_f2/mock_input.csv \
         --workdir /tmp/migration_f2_mock
 
-    What it does:
-      - For each CSV row:
-        1. Backs up the path to <workdir>/backups/ (cp -a, preserves lstat)
-        2. Rewrites file content (FAT1->FAT2, opc_d1->opc_d2, etc.)
-        3. Renames the path if its name contains a mapping key
-        4. Restores the original mtime via touch -h -d
-      - Appends BACKED_UP then COMPLETED to <workdir>/progress.log per row
-      - Directories: renames the dir, then rewrites ALL files inside it
-      - Symlinks: rewrites the symlink target, then renames the symlink
-
-    What to check:
-      - No errors or "FAILED" lines
-      - "rows processed" count matches expectation
-      - Spot-check a few paths, e.g.:
-          ls /tmp/mock_f2/applications/opc_d2/security/pkibot_config/
-          # Should show fat2_mq_jks.pkibot.ini (not fat1_...)
-          readlink /tmp/mock_f2/applications/opc_d2/bin/env/bld.proxy.FAT2
-          # Should show: bld.proxy
-
-    Parameters explained:
-      --root      Safety guard. Every CSV path is asserted under this dir.
-                  /tmp root = mock mode (no confirmation prompt).
-      --csv       The 3-column input. Use mock_input.csv from Step 1.
-      --workdir   Where backups + tracking live. Reusing same workdir = resume.
+    Check: all rows COMPLETED, no FAILED lines.
 
   Step 3 — Validate
   ──────────────────
 
     bash bin/validate.sh \
         --root /tmp/mock_f2 \
-        --workdir /tmp/migration_f2_mock
+        --workdir /tmp/migration_f2_mock \
+        --verbose
 
-    What it does:
-      - Reads progress.log, checks every COMPLETED row:
-        - Migrated path exists
-        - Backup exists
-        - mtime matches recorded timestamp
-        - lstat type matches backup (file/dir/symlink)
-        - Content is consistent with MIGRATION_MAP
-        - Symlink targets are correct
+    Check: "VALIDATE PASSED", 0 failures. Review the log file.
 
-    What to check:
-      - Exit code 0 = all checks passed
-      - Any FAIL lines indicate which path has a problem
-
-    Optional: add --scan-root for tree-wide residual scan:
-      bash bin/validate.sh \
-          --root /tmp/mock_f2 \
-          --workdir /tmp/migration_f2_mock \
-          --scan-root /tmp/mock_f2
-      (Informational only — warns about any leftover fat1 references)
-
-  Step 4 — Rollback (verify rollback works)
-  ──────────────────────────────────────────
+  Step 4 — Rollback + validate
+  ─────────────────────────────
 
     bash bin/migrator.sh \
         --mode rollback \
         --root /tmp/mock_f2 \
-        --workdir /tmp/migration_f2_mock
+        --workdir /tmp/migration_f2_mock \
+        --validate
 
-    What it does:
-      - Walks progress.log in reverse
-      - Restores each COMPLETED row from its backup (cp -a)
-      - Restores original mtime
-      - Appends ROLLED_BACK to tracking
-
-    What to check:
-      - Original filenames are back (fat1_... not fat2_...)
-      - Content has original references (FAT1, opc_d1)
-      - Symlink bld.proxy.FAT1 -> bld.proxy is restored
-      - Spot-check:
-          ls /tmp/mock_f2/applications/opc_d2/security/pkibot_config/
-          grep FAT1 /tmp/mock_f2/applications/opc_d2/application/Server_8_FAT2/bin/setenv.sh
+    Check: "Rollback validation passed." All names, content, mtimes restored.
 
   Step 5 — Cleanup mock
   ──────────────────────
@@ -144,24 +77,18 @@
         --root /tmp/mock_f2 \
         --workdir /tmp/migration_f2_mock
 
-    rm -rf /tmp/mock_f2
+    rm -rf /tmp/mock_f2 /tmp/migration_f2_mock
 
-    What it does:
-      - Deletes backups/ and progress.log from workdir
-      - Then we remove the mock tree entirely
-
-  Mock rehearsal verdict:
-    If Steps 1-4 completed without errors, the scripts work against your
-    real data. Proceed to Run 2.
+  Verdict: if Steps 1–4 passed, proceed to Run 2.
 
 
 ================================================================================
   RUN 2: LIVE MIGRATION
 ================================================================================
 
-  CAUTION: This modifies /applications/opc_d2 in place.
-  Backups are stored under /tmp — do NOT let a reboot or tmpfiles sweeper
-  run between execute and validate. Complete the full cycle in one session.
+  CRITICAL: Backups live in /tmp. Complete the entire cycle in ONE session.
+  A reboot or /tmp sweep between execute and validate means backups are
+  gone and rollback is impossible.
 
   Step 1 — Execute
   ─────────────────
@@ -169,22 +96,13 @@
     bash bin/migrator.sh \
         --mode execute \
         --root /applications/opc_d2 \
-        --csv tests/cases/fat2.csv \
+        --csv fat2.csv \
         --workdir /tmp/migration_f2 \
         --yes
 
-    What happens:
-      - --yes is REQUIRED for non-/tmp roots
-      - A 5-second countdown appears: "Press Ctrl-C to abort"
-      - Then the same backup -> rewrite -> rename -> mtime-restore cycle
-      - Backups go to /tmp/migration_f2/backups/applications/opc_d2/...
-      - Tracking at /tmp/migration_f2/progress.log
-
-    If killed mid-run:
-      Just re-run the exact same command. It reads progress.log:
-        - COMPLETED rows are skipped
-        - BACKED_UP rows are restored from backup then re-executed
-        - Fresh rows proceed normally
+    - --yes is required for non-/tmp roots (triggers 5s countdown)
+    - Every CSV path is asserted under --root before any mutation
+    - Each row: backup -> rewrite content -> rename -> restore mtime
 
   Step 2 — Validate
   ──────────────────
@@ -192,97 +110,137 @@
     bash bin/validate.sh \
         --root /applications/opc_d2 \
         --workdir /tmp/migration_f2 \
-        --scan-root /applications/opc_d2
+        --verbose
 
-    Exit code 0 = migration is consistent and complete.
+    Check: "VALIDATE PASSED". Review the log file for any anomalies.
+    Optional: add --scan-root /applications/opc_d2 for tree-wide residual scan.
 
-    Spot-check manually:
-      ls /applications/opc_d2/security/pkibot_config/
-      # fat2_mq_jks.pkibot.ini, fat2_tomcat_jks.pkibot.ini, ...
+  Step 3 — Decision
+  ──────────────────
 
-      grep -l FAT1 /applications/opc_d2/application/Server_8_FAT2/bin/setenv.sh
-      # Should return nothing (no FAT1 references left)
-
-      readlink /applications/opc_d2/bin/env/bld.proxy.FAT2
-      # Should show: bld.proxy
-
-  Step 3 — Decision point
-  ────────────────────────
-
-    IF VALIDATE PASSED and you're satisfied:
+    HAPPY PATH (validate passed, migration looks good):
 
       bash bin/migrator.sh \
           --mode cleanup \
           --root /applications/opc_d2 \
           --workdir /tmp/migration_f2
 
-      This deletes backups and tracking. Migration is now permanent.
+      WARNING: Cleanup deletes backups and tracking. After this:
+        - Rollback is IMPOSSIBLE
+        - Re-running execute would re-migrate already-migrated files
+          (creates new backups of the migrated state — not the originals)
+      Only run cleanup when you are certain the migration is correct.
 
-    IF SOMETHING IS WRONG:
+    UNHAPPY PATH (validate failed or something looks wrong):
 
       bash bin/migrator.sh \
           --mode rollback \
           --root /applications/opc_d2 \
           --workdir /tmp/migration_f2 \
-          --yes
+          --yes \
+          --validate
 
-      This restores every path from backup. Tree returns to pre-migration state.
-      Then investigate what went wrong before retrying.
+      This restores every path from backup and validates the rollback.
+      Then investigate, fix the issue, and re-run from Step 1.
 
 
 ================================================================================
-  EMERGENCY: RESUME AFTER CRASH / KILL / DISCONNECT
+  FAILURE SCENARIOS
 ================================================================================
 
-  If the execute was interrupted (kill, SSH disconnect, etc.):
+  EXECUTE KILLED (SSH drop, kill, Ctrl-C, disk full):
 
-    1. Re-run the exact same execute command:
+    Re-run the exact same execute command. It resumes automatically:
+      - COMPLETED rows: skipped
+      - BACKED_UP rows: restored from backup, then re-executed
+      - Unstarted rows: processed fresh
 
-       bash bin/migrator.sh \
-           --mode execute \
-           --root /applications/opc_d2 \
-           --csv tests/cases/fat2.csv \
-           --workdir /tmp/migration_f2 \
-           --yes
+    bash bin/migrator.sh \
+        --mode execute \
+        --root /applications/opc_d2 \
+        --csv fat2.csv \
+        --workdir /tmp/migration_f2 \
+        --yes
 
-    2. It picks up from progress.log automatically:
-       - COMPLETED rows -> skipped
-       - BACKED_UP rows -> restored from backup, then re-executed
-       - Unstarted rows -> processed fresh
+  ROLLBACK KILLED:
 
-    3. Then validate as normal.
+    Re-run the exact same rollback command. It resumes:
+      - ROLLED_BACK rows: skipped
+      - COMPLETED/BACKED_UP rows: restored from backup
 
-  If /tmp was wiped (reboot, tmpfiles sweeper):
+    bash bin/migrator.sh \
+        --mode rollback \
+        --root /applications/opc_d2 \
+        --workdir /tmp/migration_f2 \
+        --yes \
+        --validate
 
-    Backups are gone. You cannot rollback. Options:
-    a. If the CSV has paths that weren't touched yet, they're still original.
-    b. Re-run selective_copy.sh from the fat1 user to restore from fat1.
-    c. This is why we say: complete the cycle in one session.
+  VALIDATE FAILS (mtime mismatch, content mismatch, missing path):
+
+    DO NOT cleanup. Options:
+    a. If the failure is minor (e.g. one file), investigate and fix manually,
+       then re-run validate.
+    b. If the failure is systemic, rollback and investigate:
+       bash bin/migrator.sh --mode rollback --root /applications/opc_d2 \
+           --workdir /tmp/migration_f2 --yes --validate
+
+  /tmp WIPED (reboot, tmpfiles.d sweeper):
+
+    Backups and tracking are gone. Cannot rollback.
+    Options:
+    a. Paths not yet processed are still in original state.
+    b. Re-run selective_copy.sh from fat1 user to restore from fat1 tree.
+    c. This is why we say: one continuous session.
+
+  CLEANUP ALREADY RAN BUT MIGRATION IS WRONG:
+
+    Cannot rollback (backups deleted). Options:
+    a. Re-run selective_copy.sh from fat1 to restore the tree.
+    b. Manually fix the affected paths using the validate log for guidance.
+
+
+================================================================================
+  WHAT CLEANUP DOES AND DOES NOT DO
+================================================================================
+
+  DOES:
+    - Removes <workdir>/backups/ (all backup copies)
+    - Removes <workdir>/progress.log (tracking file)
+    - Leaves migrator/validate log files for audit
+
+  DOES NOT:
+    - Touch the migrated tree (/applications/opc_d2 or mock)
+    - Remove the workdir itself
+    - Remove the CSV or scripts
+
+  AFTER CLEANUP:
+    - Rollback is impossible (no backups)
+    - Re-running execute creates fresh backups of the CURRENT state
+      (which is the migrated state, not the original)
+    - Double cleanup is safe (idempotent)
 
 
 ================================================================================
   QUICK REFERENCE
 ================================================================================
 
-  mock_build.sh parameters:
-    --csv          (required) 3-column CSV
-    --source-root  (required) Where CSV paths live on disk
-    --mock-root    (optional) Default: /tmp/mock_f2
-    --reset        (optional) Wipe mock-root before starting
+  mock_build.sh:
+    --csv <path>          3-column CSV (required)
+    --source-root <path>  Where live paths are (required)
+    --mock-root <path>    Default: /tmp/mock_f2
+    --reset               Wipe mock-root first
 
-  migrator.sh parameters:
-    --mode         (required) execute | rollback | cleanup | validate
-    --root         (required) Base dir; safety guard for all CSV paths
-    --csv          (required for execute) 3-column CSV
-    --workdir      (optional) Default: /tmp/migration_f2
-    --yes          (required for non-/tmp --root)
-    --dry-run      (optional) Preview without touching disk
-    --backup-dir   (optional) Default: <workdir>/backups
-    --tracking-file (optional) Default: <workdir>/progress.log
+  migrator.sh:
+    --mode <mode>         execute | rollback | cleanup (required)
+    --root <path>         Safety guard — all paths must be under this (required)
+    --csv <path>          Input CSV (required for execute)
+    --workdir <path>      Default: /tmp/migration_f2
+    --yes                 Required for non-/tmp roots
+    --validate            Run post-rollback validation (rollback only)
+    --dry-run             Preview without mutations
 
-  validate.sh parameters:
-    --root         (required) Same --root as migrator
-    --workdir      (optional) Default: /tmp/migration_f2
-    --scan-root    (optional) Tree-wide residual fat1 reference scan
-    --backup-dir   (optional) Default: <workdir>/backups
-    --tracking-file (optional) Default: <workdir>/progress.log
+  validate.sh:
+    --root <path>         Same --root as migrator (required)
+    --workdir <path>      Default: /tmp/migration_f2
+    --verbose             Show per-row detail + diffs
+    --scan-root <path>    Tree-wide residual fat1 reference scan
