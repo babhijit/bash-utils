@@ -7,9 +7,6 @@
 *.swp
 *~
 
-# Local docs — kept out of public repo
-docs/
-
 # Test artifacts
 *.log
 
