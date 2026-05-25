@@ -330,9 +330,11 @@ txns.csv,${OPC}/home/xbapp_d2/txns.csv,${TS_C}.000000000 +0200
 jks.tomc.inf,${OPC}/security/jks.tomc.inf,${TS_B}.000000000 +0200
 convert_cacerts_to_pem.sh,${OPC}/security/pkibot_config/convert_cacerts_to_pem.sh,${TS_B}.000000000 +0200
 fat1_mq_jks.pkibot.ini,${OPC}/security/pkibot_config/fat1_mq_jks.pkibot.ini,${TS_B}.000000000 +0200
+fat2_mq_jks.pkibot.ini,${OPC}/security/pkibot_config/fat2_mq_jks.pkibot.ini,${TS_B}.000000000 +0200
 fat1_tomcat_jks.pkibot.ini,${OPC}/security/pkibot_config/fat1_tomcat_jks.pkibot.ini,${TS_B}.000000000 +0200
 tmp_fat1_mq.jks.pkibot.ini,${OPC}/security/pkibot_config/tmp_fat1_mq.jks.pkibot.ini,${TS_B}.000000000 +0200
 tmp_fat1_tomcat_jks.pkibot.ini,${OPC}/security/pkibot_config/tmp_fat1_tomcat_jks.pkibot.ini,${TS_B}.000000000 +0200
+tmp_fat2_tomcat_jks.pkibot.ini,${OPC}/security/pkibot_config/tmp_fat2_tomcat_jks.pkibot.ini,${TS_B}.000000000 +0200
 uat1_tomcat_jks.pkibot.ini,${OPC}/security/pkibot_config/UAT1/uat1_tomcat_jks.pkibot.ini,${TS_B}.000000000 +0200
 uat2_tomcat_jks.pkibot.ini,${OPC}/security/pkibot_config/UAT2/uat2_tomcat_jks.pkibot.ini,${TS_B}.000000000 +0200
 sqlnet.ora.2024-10-25-21-35-09,${OPC}/security/wallets/fragtseppltu3a.2025-03-21-09-03-31/sqlnet.ora.2024-10-25-21-35-09,${TS_B}.000000000 +0200
@@ -407,6 +409,21 @@ phase_prepare() {
         --mock-root "${MOCK_ROOT}" \
         --reset
 
+    # --- Edge Case 2 injection ---
+    # mock_build correctly skipped tmp_fat1_tomcat_jks.pkibot.ini (MISSING).
+    # But in a live scenario the operator might have an old CSV with the fat1
+    # name while only the fat2 file exists on disk. Inject the fat1 row into
+    # mock_input.csv so migrator exercises the "fat1 absent, fat2 present"
+    # redirect logic.
+    local mock_csv="${MOCK_ROOT}/mock_input.csv"
+    local edge2_fat1="${MOCK_ROOT}${OPC}/security/pkibot_config/tmp_fat1_tomcat_jks.pkibot.ini"
+    local edge2_fat2="${MOCK_ROOT}${OPC}/security/pkibot_config/tmp_fat2_tomcat_jks.pkibot.ini"
+    if [ ! -e "$edge2_fat1" ] && [ -e "$edge2_fat2" ]; then
+        info "EDGE CASE 2: injecting fat1 row for tmp_fat1_tomcat (only fat2 exists on disk)"
+        printf '"tmp_fat1_tomcat_jks.pkibot.ini","%s","%s"\n' \
+            "$edge2_fat1" "${TS_B}.000000000 +0200" >> "$mock_csv"
+    fi
+
     success "PREPARE complete"
     info "  test_base:  ${TEST_BASE}"
     info "  mock_root:  ${MOCK_ROOT}"
@@ -426,25 +443,49 @@ assert_post_execute() {
     local opc="${MOPC}"
 
     # ---- Security: pkibot_config filename renames (fat1 -> fat2) ----
-    assert_path_absent "${opc}/security/pkibot_config/fat1_mq_jks.pkibot.ini" \
-        "fat1_mq_jks.pkibot.ini absent (renamed)"
+
+    # EDGE CASE 1: Both fat1_mq_jks and fat2_mq_jks coexist.
+    # fat1 row: migrator sees fat2 already exists, redirects — rewrites fat2 content.
+    # fat2 row: migrator processes it directly (content rewrite, stray fat1 refs fixed).
+    # Result: fat1 file stays (untouched), fat2 file has fat1 refs rewritten.
+    # The uat1 reference must NOT be touched (not in MIGRATION_MAP).
+    assert_path_exists "${opc}/security/pkibot_config/fat1_mq_jks.pkibot.ini" \
+        "fat1_mq_jks.pkibot.ini still present (target existed, fat1 left alone)"
     assert_path_exists "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
         "fat2_mq_jks.pkibot.ini present"
+    assert_file_lacks "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
+        "opcsvcf1" "fat2_mq_jks: no opcsvcf1 remaining (content rewritten)"
+    assert_file_contains "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
+        "opcsvcf2" "fat2_mq_jks: has opcsvcf2"
+    assert_file_lacks "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
+        "opc_d1" "fat2_mq_jks: no opc_d1 remaining"
+    assert_file_contains "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
+        "opc_d2" "fat2_mq_jks: has opc_d2"
+    assert_file_contains "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
+        "uat1" "fat2_mq_jks: uat1 reference preserved (not in MIGRATION_MAP)"
 
+    # Normal case: only fat1_tomcat exists, renamed to fat2_tomcat
     assert_path_absent "${opc}/security/pkibot_config/fat1_tomcat_jks.pkibot.ini" \
-        "fat1_tomcat_jks.pkibot.ini absent"
+        "fat1_tomcat_jks.pkibot.ini absent (renamed)"
     assert_path_exists "${opc}/security/pkibot_config/fat2_tomcat_jks.pkibot.ini" \
         "fat2_tomcat_jks.pkibot.ini present"
 
+    # Normal case: only tmp_fat1_mq exists, renamed to tmp_fat2_mq
     assert_path_absent "${opc}/security/pkibot_config/tmp_fat1_mq.jks.pkibot.ini" \
         "tmp_fat1_mq.jks.pkibot.ini absent"
     assert_path_exists "${opc}/security/pkibot_config/tmp_fat2_mq.jks.pkibot.ini" \
         "tmp_fat2_mq.jks.pkibot.ini present"
 
+    # EDGE CASE 2: CSV lists tmp_fat1_tomcat but ONLY tmp_fat2_tomcat exists on disk.
+    # Migrator finds the target already present, rewrites stray fat1 refs in content.
     assert_path_absent "${opc}/security/pkibot_config/tmp_fat1_tomcat_jks.pkibot.ini" \
-        "tmp_fat1_tomcat_jks.pkibot.ini absent"
+        "tmp_fat1_tomcat_jks.pkibot.ini absent (never existed)"
     assert_path_exists "${opc}/security/pkibot_config/tmp_fat2_tomcat_jks.pkibot.ini" \
         "tmp_fat2_tomcat_jks.pkibot.ini present"
+    assert_file_lacks "${opc}/security/pkibot_config/tmp_fat2_tomcat_jks.pkibot.ini" \
+        "opcsvcf1" "tmp_fat2_tomcat_jks: no opcsvcf1 remaining (content rewritten)"
+    assert_file_lacks "${opc}/security/pkibot_config/tmp_fat2_tomcat_jks.pkibot.ini" \
+        "opc_d1" "tmp_fat2_tomcat_jks: no opc_d1 remaining"
 
     # ---- Server_8_FAT2/bin/setenv.sh content rewrites ----
     local setenv="${opc}/application/Server_8_FAT2/bin/setenv.sh"
@@ -622,25 +663,40 @@ assert_post_rollback() {
     local opc="${MOPC}"
 
     # ---- Security: pkibot_config filenames restored ----
-    assert_path_exists "${opc}/security/pkibot_config/fat1_mq_jks.pkibot.ini" \
-        "fat1_mq_jks.pkibot.ini restored"
-    assert_path_absent "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
-        "fat2_mq_jks.pkibot.ini absent"
 
+    # EDGE CASE 1 rollback: fat2_mq_jks restored from backup (original had stray
+    # fat1 refs + uat1). Rollback brings those fat1 refs back.
+    assert_path_exists "${opc}/security/pkibot_config/fat1_mq_jks.pkibot.ini" \
+        "fat1_mq_jks.pkibot.ini still present"
+    assert_path_exists "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
+        "fat2_mq_jks.pkibot.ini restored"
+    assert_file_contains "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
+        "opcsvcf1" "fat2_mq_jks: opcsvcf1 restored (original stray fat1 ref)"
+    assert_file_contains "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" \
+        "uat1" "fat2_mq_jks: uat1 reference preserved after rollback"
+
+    # Normal rollback: fat1_tomcat restored from backup, fat2_tomcat removed
     assert_path_exists "${opc}/security/pkibot_config/fat1_tomcat_jks.pkibot.ini" \
         "fat1_tomcat_jks.pkibot.ini restored"
     assert_path_absent "${opc}/security/pkibot_config/fat2_tomcat_jks.pkibot.ini" \
         "fat2_tomcat_jks.pkibot.ini absent"
 
+    # Normal rollback: tmp_fat1_mq restored
     assert_path_exists "${opc}/security/pkibot_config/tmp_fat1_mq.jks.pkibot.ini" \
         "tmp_fat1_mq.jks.pkibot.ini restored"
     assert_path_absent "${opc}/security/pkibot_config/tmp_fat2_mq.jks.pkibot.ini" \
         "tmp_fat2_mq.jks.pkibot.ini absent"
 
-    assert_path_exists "${opc}/security/pkibot_config/tmp_fat1_tomcat_jks.pkibot.ini" \
-        "tmp_fat1_tomcat_jks.pkibot.ini restored"
-    assert_path_absent "${opc}/security/pkibot_config/tmp_fat2_tomcat_jks.pkibot.ini" \
-        "tmp_fat2_tomcat_jks.pkibot.ini absent"
+    # EDGE CASE 2 rollback: tmp_fat2_tomcat restored from backup (original had
+    # stray fat1 refs). Rollback brings those back.
+    assert_path_absent "${opc}/security/pkibot_config/tmp_fat1_tomcat_jks.pkibot.ini" \
+        "tmp_fat1_tomcat_jks.pkibot.ini still absent (never existed)"
+    assert_path_exists "${opc}/security/pkibot_config/tmp_fat2_tomcat_jks.pkibot.ini" \
+        "tmp_fat2_tomcat_jks.pkibot.ini restored"
+    assert_file_contains "${opc}/security/pkibot_config/tmp_fat2_tomcat_jks.pkibot.ini" \
+        "opcsvcf1" "tmp_fat2_tomcat_jks: opcsvcf1 restored (original stray fat1 ref)"
+    assert_file_contains "${opc}/security/pkibot_config/tmp_fat2_tomcat_jks.pkibot.ini" \
+        "opc_d1" "tmp_fat2_tomcat_jks: opc_d1 restored"
 
     # ---- setenv.sh content restored ----
     local setenv="${opc}/application/Server_8_FAT2/bin/setenv.sh"
@@ -707,8 +763,8 @@ assert_post_rollback() {
         "setenv.sh mtime preserved after rollback (TS_A)"
     assert_mtime_epoch "${opc}/bin/env/bld.proxy.FAT1" "${TS_B_EPOCH}" \
         "bld.proxy.FAT1 mtime preserved after rollback (TS_B)"
-    assert_mtime_epoch "${opc}/security/pkibot_config/fat1_mq_jks.pkibot.ini" "${TS_B_EPOCH}" \
-        "fat1_mq_jks.pkibot.ini mtime preserved after rollback (TS_B)"
+    assert_mtime_epoch "${opc}/security/pkibot_config/fat2_mq_jks.pkibot.ini" "${TS_B_EPOCH}" \
+        "fat2_mq_jks.pkibot.ini mtime preserved after rollback (TS_B)"
     assert_mtime_epoch "${opc}/tools/pkibot_working/mq-opcsvcf1" "${TS_C_EPOCH}" \
         "pkibot_working/mq-opcsvcf1 dir mtime preserved after rollback (TS_C)"
 }

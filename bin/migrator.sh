@@ -191,6 +191,21 @@ tracking_latest_status_for() {
     echo "$status"
 }
 
+# tracking_field_for <path> <field_number>
+# Returns field N (1-based) from the latest tracking entry for <path>.
+# Fields: 1=Original_Path 2=New_Path 3=Backup_Path 4=Timestamp 5=Status
+tracking_field_for() {
+    local target="$1"
+    local fieldnum="$2"
+    [ -f "$TRACKING_FILE" ] || { echo ""; return; }
+    local val
+    val=$(tac "$TRACKING_FILE" 2>/dev/null \
+        | awk -F'","' -v target="\"$target" -v fn="$fieldnum" '
+            $1 == target { gsub(/(^"|"$)/, "", $fn); print $fn; exit }
+        ') || true
+    echo "$val"
+}
+
 # =============================================================================
 #                              ARGUMENT PARSING
 # =============================================================================
@@ -301,13 +316,24 @@ process_row() {
             return 0
             ;;
         BACKED_UP)
-            # Partial state from a prior killed run.
+            # Partial state from a prior killed run. Look up stored backup
+            # path from tracking — for redirected rows, the backup is of
+            # new_path, not orig_path.
             if [ "$DRY_RUN" -eq 1 ]; then
                 info "DRY-RUN: row in BACKED_UP state; would restore from backup before redoing: $orig_path"
                 return 0
             fi
+            local stored_bkp stored_newp
+            stored_bkp=$(tracking_field_for "$orig_path" 3)
+            stored_newp=$(tracking_field_for "$orig_path" 2)
+            local resume_target="$orig_path"
+            if [ -n "$stored_newp" ] && [ -n "$stored_bkp" ] && \
+               [ "$(backup_path_for "$stored_newp")" = "$stored_bkp" ] && \
+               [ "$stored_newp" != "$orig_path" ]; then
+                resume_target="$stored_newp"
+            fi
             warn "RESUME: previous run left $orig_path in BACKED_UP state. Restoring from backup before redoing."
-            restore_from_backup "$orig_path"
+            restore_from_backup "$orig_path" "${stored_bkp:-}" "$resume_target"
             ;;
         ROLLED_BACK|"")
             : # fresh row, nothing to do
@@ -317,48 +343,86 @@ process_row() {
             ;;
     esac
 
-    # Source path must exist after any restore.
-    if [ ! -e "$orig_path" ] && [ ! -L "$orig_path" ]; then
-        warn "SKIP: source path not found: $orig_path"
+    # --- Determine the effective source to process ---
+    #
+    # If orig != new, the path would normally be renamed. But if the target
+    # (new_path) already exists on disk, we process IT directly:
+    #   - Content rewrite on new_path (it may still contain fat1 references)
+    #   - No rename (target already has the correct name)
+    #   - Backup is of new_path (the file we're actually modifying)
+    #
+    # This handles the real-world case where both fat1_*.ini and fat2_*.ini
+    # coexist in the same directory. The fat2 file is already "in place" but
+    # its content may still need rewriting.
+    #
+    # Three sub-cases when orig_path != new_path:
+    #   A) Only orig exists          -> backup orig, rewrite, rename (normal)
+    #   B) new_path exists (±orig)   -> backup new_path, rewrite it, no rename
+    #   C) Neither exists            -> skip
+
+    local effective_src="$orig_path"
+    local effective_dst="$new_path"
+
+    if [ "$orig_path" != "$new_path" ] && \
+       { [ -e "$new_path" ] || [ -L "$new_path" ]; }; then
+        # Case B: target already on disk. Redirect to process it directly.
+        info "TARGET EXISTS: $new_path already present; processing it directly (content rewrite only)"
+        effective_src="$new_path"
+        effective_dst="$new_path"
+    fi
+
+    # Effective source must exist.
+    if [ ! -e "$effective_src" ] && [ ! -L "$effective_src" ]; then
+        warn "SKIP: source path not found: $effective_src"
         return 0
     fi
 
     local bkp
-    bkp="$(backup_path_for "$orig_path")"
+    bkp="$(backup_path_for "$effective_src")"
 
     if [ "$DRY_RUN" -eq 1 ]; then
-        info "DRY-RUN: would back up $orig_path -> $bkp"
-        info "DRY-RUN: would migrate -> $new_path"
+        info "DRY-RUN: would back up $effective_src -> $bkp"
+        info "DRY-RUN: would migrate -> $effective_dst"
         return 0
     fi
 
     # --- Backup ---
+    # Guard: if the backup already exists, preserve it. This happens when
+    # two CSV rows converge on the same effective file (e.g. fat1_mq_jks
+    # redirected to fat2_mq_jks, and fat2_mq_jks also has its own row).
+    # The FIRST backup captures the original state; overwriting it with a
+    # second cp -a after content has already been rewritten would lose the
+    # original.
     safe_mkdir_p "$(dirname "$bkp")"
-    if ! cp -a "$orig_path" "$bkp"; then
-        die "BACKUP failed for '$orig_path' -> '$bkp'. Halting before any mutation."
+    if [ -e "$bkp" ] || [ -L "$bkp" ]; then
+        info "BACKUP EXISTS (preserving original): $bkp"
+    else
+        if ! cp -a "$effective_src" "$bkp"; then
+            die "BACKUP failed for '$effective_src' -> '$bkp'. Halting before any mutation."
+        fi
     fi
-    tracking_append "$orig_path" "$new_path" "$bkp" "$ts" "BACKED_UP"
+    tracking_append "$orig_path" "$effective_dst" "$bkp" "$ts" "BACKED_UP"
 
     # --- Mutate (symlink / dir / file) ---
-    if [ -L "$orig_path" ]; then
-        migrate_symlink "$orig_path" "$new_path"
-    elif [ -d "$orig_path" ]; then
-        migrate_directory "$orig_path" "$new_path"
-    elif [ -f "$orig_path" ]; then
-        migrate_file "$orig_path" "$new_path"
+    if [ -L "$effective_src" ]; then
+        migrate_symlink "$effective_src" "$effective_dst"
+    elif [ -d "$effective_src" ]; then
+        migrate_directory "$effective_src" "$effective_dst"
+    elif [ -f "$effective_src" ]; then
+        migrate_file "$effective_src" "$effective_dst"
     else
-        warn "Unrecognized lstat type for $orig_path; skipping mutation"
+        warn "Unrecognized lstat type for $effective_src; skipping mutation"
     fi
 
     # --- Restore mtime ---
     # The mutation steps may have bumped mtime; restore from the timestamp
     # captured at finder/mock-build time. Use -h so symlinks aren't
     # dereferenced.
-    if ! restore_mtime_from_human "$new_path" "$ts" 2>/dev/null; then
-        warn "Timestamp restore failed for: $new_path"
+    if ! restore_mtime_from_human "$effective_dst" "$ts" 2>/dev/null; then
+        warn "Timestamp restore failed for: $effective_dst"
     fi
 
-    tracking_append "$orig_path" "$new_path" "$bkp" "$ts" "COMPLETED"
+    tracking_append "$orig_path" "$effective_dst" "$bkp" "$ts" "COMPLETED"
     success "COMPLETED: $orig_path"
 }
 
@@ -446,10 +510,18 @@ run_execute() {
 # original path from its backup. For BACKED_UP-but-not-COMPLETED rows, also
 # restore (no harm done). For ROLLED_BACK rows, skip (already done).
 
+# restore_from_backup <orig_path> [backup_path] [restore_target]
+#   orig_path      — the CSV-listed path (used to compute new_path for cleanup)
+#   backup_path    — where the backup lives; defaults to backup_path_for(orig_path)
+#   restore_target — where to restore TO; defaults to orig_path
+#
+# When a row was redirected (target already existed), the backup is of the
+# target, not the CSV path. The optional arguments let rollback pass the
+# correct locations from tracking rather than recomputing.
 restore_from_backup() {
     local orig_path="$1"
-    local bkp
-    bkp="$(backup_path_for "$orig_path")"
+    local bkp="${2:-$(backup_path_for "$orig_path")}"
+    local restore_to="${3:-$orig_path}"
 
     if [ ! -e "$bkp" ] && [ ! -L "$bkp" ]; then
         warn "Backup missing for $orig_path (expected at $bkp); cannot restore"
@@ -464,13 +536,17 @@ restore_from_backup() {
     if [ "$new_path" != "$orig_path" ] && { [ -e "$new_path" ] || [ -L "$new_path" ]; }; then
         rm -rf "$new_path"
     fi
-    if [ -e "$orig_path" ] || [ -L "$orig_path" ]; then
+    if [ "$restore_to" != "$new_path" ] && { [ -e "$restore_to" ] || [ -L "$restore_to" ]; }; then
+        rm -rf "$restore_to"
+    fi
+    if [ "$orig_path" != "$new_path" ] && [ "$orig_path" != "$restore_to" ] && \
+       { [ -e "$orig_path" ] || [ -L "$orig_path" ]; }; then
         rm -rf "$orig_path"
     fi
 
-    safe_mkdir_p "$(dirname "$orig_path")"
-    if ! cp -a "$bkp" "$orig_path"; then
-        warn "cp -a failed restoring $orig_path from $bkp"
+    safe_mkdir_p "$(dirname "$restore_to")"
+    if ! cp -a "$bkp" "$restore_to"; then
+        warn "cp -a failed restoring $restore_to from $bkp"
         return 1
     fi
     return 0
@@ -482,10 +558,14 @@ run_rollback() {
 
     live_safety_gate
 
-    # Collect the set of original paths we have backups for, by walking the
-    # tracking file. Latest status per path wins. Dedupe via assoc array.
+    # Collect the latest state per original path from tracking. We store
+    # backup_path and new_path from tracking rather than recomputing them,
+    # because redirected rows (target-already-existed) backed up the target
+    # instead of the CSV path.
     declare -A latest_status
     declare -A ts_for_path
+    declare -A bkp_for_path
+    declare -A newp_for_path
     local orig newp bkp ts status
 
     local tmp_log
@@ -496,10 +576,14 @@ run_rollback() {
     # latest_status[path] holds the most recent status.
     while IFS=, read -r orig newp bkp ts status; do
         orig=$(csv_strip_field "$orig")
+        newp=$(csv_strip_field "$newp")
+        bkp=$(csv_strip_field "$bkp")
         ts=$(csv_strip_field "$ts")
         status=$(csv_strip_field "$status")
         latest_status["$orig"]="$status"
         ts_for_path["$orig"]="$ts"
+        bkp_for_path["$orig"]="$bkp"
+        newp_for_path["$orig"]="$newp"
     done < "$tmp_log"
     rm -f "$tmp_log"
 
@@ -516,6 +600,17 @@ run_rollback() {
         done_rollback["$orig"]=1
 
         local cur_status="${latest_status[$orig]:-}"
+        local row_bkp="${bkp_for_path[$orig]:-}"
+        local row_newp="${newp_for_path[$orig]:-}"
+        # Determine where to restore. For redirected rows (target existed),
+        # the backup is of new_path and restore target is new_path (not orig).
+        local restore_to="$orig"
+        if [ -n "$row_newp" ] && [ "$row_newp" = "$row_bkp" ] || \
+           [ "$(backup_path_for "$row_newp")" = "$row_bkp" ]; then
+            # Backup was of new_path (redirected row) — restore to new_path.
+            restore_to="$row_newp"
+        fi
+
         case "$cur_status" in
             ROLLED_BACK)
                 info "SKIP (already rolled back): $orig"
@@ -526,12 +621,12 @@ run_rollback() {
                     info "DRY-RUN: would restore $orig from backup"
                     continue
                 fi
-                if restore_from_backup "$orig"; then
+                if restore_from_backup "$orig" "$row_bkp" "$restore_to"; then
                     # Restore mtime on the now-restored path
-                    if ! restore_mtime_from_human "$orig" "${ts_for_path[$orig]}" 2>/dev/null; then
-                        warn "Timestamp restore failed for: $orig"
+                    if ! restore_mtime_from_human "$restore_to" "${ts_for_path[$orig]}" 2>/dev/null; then
+                        warn "Timestamp restore failed for: $restore_to"
                     fi
-                    tracking_append "$orig" "$orig" "$(backup_path_for "$orig")" \
+                    tracking_append "$orig" "$restore_to" "$row_bkp" \
                         "${ts_for_path[$orig]}" "ROLLED_BACK"
                     success "ROLLED_BACK: $orig"
                     count=$((count + 1))
