@@ -20,17 +20,26 @@
 # Modes:
 #   --mode name     Match by basename only.
 #   --mode content  Match by file content only (skips binaries and
-#                   CONTENT_SEARCH_EXCLUDE_FILES).
-#   --mode both     Single-pass combined search (~2x faster than running
-#                   name + content separately).
+#                   CONTENT_SEARCH_EXCLUDE_FILES). One multi-pattern grep
+#                   per file.
+#   --mode both     Run name pass then content pass. Two tree walks.
+#
+# Path keys / symlink handling:
+#   - Regular files and directories are keyed by their canonical realpath
+#     for stable deduplication.
+#   - Symlinks are keyed by the symlink path itself, NOT by realpath of
+#     the target. A symlink and its target are intentionally kept as
+#     separate rows so migrator.sh can retarget the symlink AND rewrite
+#     the target.
 #
 # Output (stdout, CSV):
 #   Default: Name,Absolute_Path,Match_Filter_Type,Filter_Value,Last_Modified
 #   --minimal: Name,Absolute_Path,Last_Modified
 #
-#   Default always dedupes by absolute path; if the same path matches by
+#   Default always dedupes by match key; if the same path matches by
 #   both name and content, the row is emitted once with Match_Filter_Type
-#   = "Both" and Filter_Value listing both.
+#   = "Both" and Filter_Value listing both. Fields containing literal
+#   double-quotes are CSV-escaped (RFC-4180 style: `"` -> `""`).
 #
 # =============================================================================
 
@@ -42,7 +51,9 @@ source "${SCRIPT_DIR}/common.sh"
 # from running when sourced.
 # shellcheck source=migrator.sh
 source "${SCRIPT_DIR}/migrator.sh"
-require_bash_version 4 0
+# Floor is 4.2 (not 4.0): migrator.sh's `declare -Ar` requires 4.2, and
+# finder uses `${var,,}` lower-casing which requires 4.0. Match migrator.
+require_bash_version 4 2
 set -euo pipefail
 
 # =============================================================================
@@ -149,14 +160,16 @@ parse_args() {
 
 # build_prune_args
 # Echoes the find(1) prune expression for EXCLUDE_DIRS, one argument per
-# line. Empty if EXCLUDE_DIRS is empty. -iname is used so case differences
-# don't slip past the prune.
+# line. Empty if EXCLUDE_DIRS is empty. -type d restricts the prune to
+# DIRECTORIES — without it, a regular file named "log" would also be
+# pruned, which silently dropped legitimate name-match candidates.
+# -iname is used so case differences don't slip past the prune.
 build_prune_args() {
     [ ${#EXCLUDE_DIRS[@]} -eq 0 ] && return 0
     local prune_paths=()
     local dir
     for dir in "${EXCLUDE_DIRS[@]}"; do
-        prune_paths+=(-o -iname "$dir")
+        prune_paths+=(-o -type d -iname "$dir")
     done
     printf '%s\n' "("
     local arg
@@ -165,6 +178,36 @@ build_prune_args() {
     done
     printf '%s\n' ")"
     printf '%s\n' "-prune"
+}
+
+# match_key_for <path>
+# Returns a stable key for accumulating matches against <path>.
+#   - Symlinks: the symlink path itself (preserves it as a distinct row
+#     from its realpath target).
+#   - Everything else: realpath, falling back to the input on failure.
+# Symlinks need their own row so migrator can retarget them in addition
+# to rewriting the file behind them.
+match_key_for() {
+    local path="$1"
+    if [ -L "$path" ]; then
+        printf '%s' "$path"
+        return
+    fi
+    local rp
+    if rp=$(realpath "$path" 2>/dev/null); then
+        printf '%s' "$rp"
+    else
+        printf '%s' "$path"
+    fi
+}
+
+# csv_escape <field>
+# Echoes the field with embedded double-quotes doubled (RFC-4180). Caller
+# is responsible for wrapping the result in `"..."`. Newlines are not
+# expected in our paths or timestamps so we don't quote them.
+csv_escape() {
+    local s="$1"
+    printf '%s' "${s//\"/\"\"}"
 }
 
 # =============================================================================
@@ -210,7 +253,7 @@ search_by_name() {
     local pattern path
     for pattern in "${NAME_SEARCH_PATTERNS[@]}"; do
         while IFS= read -r -d '' path; do
-            record_name_match "$(realpath "$path")" "$pattern"
+            record_name_match "$(match_key_for "$path")" "$pattern"
         done < <(find -L "$SEARCH_DIR" "${find_prune_args[@]}" -o -iname "*$pattern*" -print0)
     done
 
@@ -229,14 +272,34 @@ search_by_content() {
         find_file_exclude_args+=(-not -iname "$pattern")
     done
 
-    local path
+    # Build a single -e arg list once; one grep invocation per file
+    # instead of one-per-pattern-per-file.
+    local grep_pattern_args=()
+    for pattern in "${CONTENT_SEARCH_PATTERNS[@]}"; do
+        grep_pattern_args+=(-e "$pattern")
+    done
+
+    local path matches m m_lc key
     while IFS= read -r -d '' path; do
-        for pattern in "${CONTENT_SEARCH_PATTERNS[@]}"; do
-            # grep -I: skip binary; -i: case-insensitive; -q: quiet.
-            if grep -I -i -q -F "$pattern" "$path" 2>/dev/null; then
-                record_content_match "$(realpath "$path")" "$pattern"
-            fi
-        done
+        # -o: print each match on its own line. -I: skip binary. -i:
+        # case-insensitive. -F: fixed strings. sort -u dedupes across
+        # repeated occurrences in the same file.
+        matches=$(grep -o -I -i -F "${grep_pattern_args[@]}" "$path" 2>/dev/null | sort -u) || true
+        [ -z "$matches" ] && continue
+
+        key="$(match_key_for "$path")"
+        # grep -o emits the matched substring with the file's original
+        # case (not the pattern's case). Lowercase-compare back to the
+        # source patterns so we record the canonical pattern token.
+        while IFS= read -r m; do
+            [ -z "$m" ] && continue
+            m_lc="${m,,}"
+            for pattern in "${CONTENT_SEARCH_PATTERNS[@]}"; do
+                if [ "${pattern,,}" = "$m_lc" ]; then
+                    record_content_match "$key" "$pattern"
+                fi
+            done
+        done <<< "$matches"
     done < <(find -L "$SEARCH_DIR" "${find_prune_args[@]}" -o -type f "${find_file_exclude_args[@]}" -print0)
 
     info "Content search done"
@@ -274,8 +337,16 @@ emit_results() {
         local nv="${MATCH_NAME_VALUES[$p]:-}"
         local cv="${MATCH_CONTENT_VALUES[$p]:-}"
 
+        # CSV-escape every field. Paths almost never contain literal
+        # double-quotes, but a stray one would corrupt every downstream
+        # tool that parses this file.
+        local e_name e_p e_ts
+        e_name="$(csv_escape "$name")"
+        e_p="$(csv_escape "$p")"
+        e_ts="$(csv_escape "$ts")"
+
         if [ "$MINIMAL" -eq 1 ]; then
-            printf '"%s","%s","%s"\n' "$name" "$p" "$ts"
+            printf '"%s","%s","%s"\n' "$e_name" "$e_p" "$e_ts"
             continue
         fi
 
@@ -290,8 +361,9 @@ emit_results() {
             match_type="Content"
             filter_value="$cv"
         fi
+        local e_filter; e_filter="$(csv_escape "$filter_value")"
         printf '"%s","%s","%s","%s","%s"\n' \
-            "$name" "$p" "$match_type" "$filter_value" "$ts"
+            "$e_name" "$e_p" "$match_type" "$e_filter" "$e_ts"
     done <<< "$sorted_paths"
 }
 
