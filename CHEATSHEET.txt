@@ -62,6 +62,14 @@ bash bin/validate.sh \
     --workdir /tmp/migration_f2 \
     --verbose
 
+# 2a. (Optional) Fix directory mtimes — migrator preserves FILE mtimes
+#     but renames bump every parent dir's mtime to "now".
+bash bin/fix_dir_mtimes.sh \
+    --root /applications/opc_d2 \
+    --cutoff "<just before migration>" \
+    --dry-run --verbose
+# Inspect dry-run; if correct, rerun without --dry-run.
+
 # 3. Decision:
 #    GOOD  -> cleanup (permanent, no rollback after this)
 #    BAD   -> rollback
@@ -104,3 +112,22 @@ IF /tmp WIPED
 -------------
 Backups gone. Cannot rollback.
 Re-run selective_copy.sh from fat1 user to restore.
+
+
+FIX DIR MTIMES (optional, post-migration)
+-----------------------------------------
+Renames bump parent dirs to "now". File mtimes are already preserved by
+migrator. To make dirs look untouched too:
+
+bash bin/fix_dir_mtimes.sh \
+    --root /applications/opc_d2 \
+    --cutoff "2026-05-25 18:00:00" \
+    --dry-run --verbose
+# then drop --dry-run
+
+- Cutoff = timestamp just before migrator ran (any `date -d` string).
+- Only touches dirs with mtime > cutoff. Never bumps forward, only back.
+- Deepest-first: children fixed before parents, fix propagates upward.
+- Run BEFORE rollback if you want consistent dir mtimes; rollback also
+  renames and will re-bump dirs.
+- No undo. Dry-run first.

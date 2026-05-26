@@ -81,6 +81,14 @@
 
   Verdict: if Steps 1–4 passed, proceed to Run 2.
 
+  Optional: between Step 3 (Validate) and Step 4 (Rollback), rehearse the
+  directory-mtime repair (see "OPTIONAL: DIRECTORY MTIME REPAIR" below):
+
+    bash bin/fix_dir_mtimes.sh \
+        --root /tmp/mock_f2 \
+        --cutoff "<just before mock execute ran>" \
+        --dry-run --verbose
+
 
 ================================================================================
   RUN 2: LIVE MIGRATION
@@ -114,6 +122,21 @@
 
     Check: "VALIDATE PASSED". Review the log file for any anomalies.
     Optional: add --scan-root /applications/opc_d2 for tree-wide residual scan.
+
+  Step 2a — Fix directory mtimes (OPTIONAL, see section below)
+  ─────────────────────────────────────────────────────────────
+
+    Migrator preserves FILE mtimes but cannot preserve directory mtimes
+    when it renames entries inside them. Run this AFTER Validate passes
+    and BEFORE Cleanup, so the tree looks untouched at the dir level too:
+
+    bash bin/fix_dir_mtimes.sh \
+        --root /applications/opc_d2 \
+        --cutoff "<timestamp just before migration ran>" \
+        --dry-run --verbose
+
+    Inspect the dry-run output. If it looks right, drop --dry-run and
+    rerun. Skip this step if dir mtimes don't matter for your audit.
 
   Step 3 — Decision
   ──────────────────
@@ -200,6 +223,65 @@
 
 
 ================================================================================
+  OPTIONAL: DIRECTORY MTIME REPAIR
+================================================================================
+
+  Background:
+    A directory's mtime updates when its DIRECTORY ENTRIES change — i.e.,
+    when something inside is CREATED, DELETED, or RENAMED. Modifying a
+    file's CONTENTS in place does NOT bump the parent dir's mtime.
+
+    Migrator renames entries (fat1_X -> fat2_X), which bumps every parent
+    dir of every renamed item to "now". Migrator restores FILE mtimes
+    from the CSV; this script does the same for DIRECTORY mtimes.
+
+  When to use it:
+    - You need the migrated tree to look "untouched" at the directory
+      level too (audit, hand-off, diff against fat1 tree).
+    - You don't care about file content history but DO care about
+      directory-level "last modified" timestamps.
+
+  When NOT to use it:
+    - You don't care about directory mtimes. (Skip the step.)
+    - Rollback is still on the table — run it BEFORE rollback if you want
+      consistent dir mtimes on the migrated tree; rollback itself also
+      renames entries (fat2_X -> fat1_X) and will bump dirs again.
+
+  How it works:
+    Phase 1 — find every dir under --root whose mtime > --cutoff.
+    Phase 2 — deepest-first, set each impacted dir's mtime to the max
+              mtime of its contents (recursively). Children get corrected
+              before parents are computed, so the fix propagates upward.
+
+    It NEVER bumps a directory's mtime forward — only earlier.
+    It only touches the directories detected in Phase 1.
+
+  Usage:
+
+    # Dry-run first — prints what would change, touches nothing
+    bash bin/fix_dir_mtimes.sh \
+        --root /applications/opc_d2 \
+        --cutoff "2026-05-25 18:00:00" \
+        --dry-run --verbose
+
+    # Apply
+    bash bin/fix_dir_mtimes.sh \
+        --root /applications/opc_d2 \
+        --cutoff "2026-05-25 18:00:00"
+
+  Picking --cutoff:
+    Use the timestamp just BEFORE migrator's execute step started. Any
+    string GNU `date -d` accepts works: "2026-05-25 18:00:00",
+    "4 days ago", "yesterday 23:00", etc.
+
+  Recovery if you ran it wrong:
+    There is no rollback for mtimes — the previous (bumped) timestamps
+    are not recorded anywhere. If you set the wrong cutoff and want to
+    undo, you would need to re-run migrator from clean state. Always
+    dry-run first.
+
+
+================================================================================
   WHAT CLEANUP DOES AND DOES NOT DO
 ================================================================================
 
@@ -244,3 +326,10 @@
     --workdir <path>      Default: /tmp/migration_f2
     --verbose             Show per-row detail + diffs
     --scan-root <path>    Tree-wide residual fat1 reference scan
+
+  fix_dir_mtimes.sh (optional, post-validate):
+    --root <path>         Tree to repair (required)
+    --cutoff "<date>"     Anything dated after this is considered bumped
+                          (required). Format: any GNU `date -d` input.
+    --dry-run             Print what would change; touch nothing
+    --verbose             Show every dir considered, not just fixed ones
