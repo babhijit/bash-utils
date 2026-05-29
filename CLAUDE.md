@@ -20,7 +20,8 @@ bin/
 ├── backup.sh                  ← backup-tree layout: backup_path_for() + backup_cp()
 ├── finder.sh                  ← discover fat1-style references in a tree
 ├── csv_reduce.sh              ← reduce finder's 5-col CSV to migrator's 3-col
-├── selective_copy.sh          ← two-stage cross-user copy via /tmp
+├── selective_copy.sh          ← two-stage cross-user copy via /tmp (config-driven: --config)
+├── selective_copy.conf.example ← sample job config for selective_copy.sh
 ├── mock_build.sh              ← build a sandbox from a CSV (smart selective copy)
 ├── migrator.sh                ← stateful path/content rewriter with backup/resume/rollback
 ├── validate.sh                ← post-migration consistency checker
@@ -171,7 +172,11 @@ Adding a new pattern is a single edit to `migration_map.sh`. The map is `declare
 
 ## Bash 4.2 idioms to preserve
 
-The host runs bash 4.2.46 (RHEL 7 era). Namerefs (`declare -n`) require 4.3+, so they cannot be used. **`eval`-based associative-array indirection** stands in for namerefs wherever a function must read or populate a caller-named array: `apply_path_mapping` and `replace_content_in_file` in `common.sh`, and `tracking_load_latest` in `tracking.sh` (which populates four caller-declared result arrays — collapsing five copy-pasted parse loops into one). The eval'd arguments are array names from trusted source files (no user input), so the usual injection concerns don't apply. Don't "modernize" this without bumping the version floor and updating `require_bash_version` calls. The suite is verified on real bash 4.2.46 + GNU coreutils via the `centos:7` container harnesses.
+The host runs bash 4.2.46 (RHEL 7 era). Namerefs (`declare -n`) require 4.3+, so they cannot be used. **`eval`-based associative-array indirection** stands in for namerefs wherever a function must read or populate a caller-named array: `apply_path_mapping` and `replace_content_in_file` in `common.sh`, and `tracking_load_latest` in `tracking.sh` (which populates four caller-declared result arrays — collapsing five copy-pasted parse loops into one). The eval'd arguments are array names from trusted source files (no user input), so the usual injection concerns don't apply. Don't "modernize" this without bumping the version floor and updating `require_bash_version` calls. The suite is verified on real bash 4.2.46 + GNU coreutils via the `centos:7` container harnesses (selective_copy's test needs rsync, absent from the base image — add it via the CentOS vault repos, or use the prebuilt `bashutils7:rsync` image).
+
+**Empty-array expansion under `set -u` is the other 4.2 trap.** `"${arr[@]}"` on an EMPTY array aborts with "unbound variable" on bash 4.2/4.3 (fixed in 4.4 — so it is invisible on bash 5.x and only bites on the target 4.2.46). Use `"${arr[@]+"${arr[@]}"}"` for any array that may be empty, or guard with `[ "${#arr[@]}" -gt 0 ]` before the loop. This bit `selective_copy.sh` (an empty `EXCLUDE_MAPPING` and no-match `rsync_exclude_args`) and surfaced only once tested on real 4.2.46.
+
+`selective_copy.sh` is **config-driven**: nothing job-specific is hardcoded. `--config <file>` (a sourced bash snippet — see `selective_copy.conf.example`) supplies `SOURCE_BASE_DIR`, `TARGET_BASE_DIR`, an optional fixed `STAGING_DIR`, and the `COPY_MAPPING` / `SYMBOLIC_LINK_MAPPING` / `EXCLUDE_MAPPING` / `NESTED_ITEM_TRANSFORM` arrays; `--source-base` / `--target-base` / `--staging-dir` override the config. `prepare` honors a fixed `--staging-dir` (created + perms set, must be empty) or falls back to `mktemp`.
 
 ## Shell hygiene patterns (don't drop these when editing)
 
