@@ -35,8 +35,15 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
-# shellcheck source=migrator.sh
-source "${SCRIPT_DIR}/migrator.sh"   # for MIGRATION_MAP + backup_path_for()
+# Depend on the shared modules — NOT on migrator.sh. (Sourcing migrator pulled
+# its entire function set, incl. a second run_validate(), into this script,
+# resolved only by definition order.)
+# shellcheck source=migration_map.sh
+source "${SCRIPT_DIR}/migration_map.sh"   # MIGRATION_MAP (data)
+# shellcheck source=backup.sh
+source "${SCRIPT_DIR}/backup.sh"           # backup_path_for()
+# shellcheck source=tracking.sh
+source "${SCRIPT_DIR}/tracking.sh"         # tracking_load_latest()
 require_bash_version 4 2
 set -euo pipefail
 
@@ -53,11 +60,8 @@ PASS=0
 FAIL=0
 VALIDATE_LOG=""   # plain-text log file (no ANSI codes)
 
-# BACKUP_DIR is a global declared by migrator.sh; backup_path_for() reads it
-# directly. We re-declare it here so validate.sh's parse_args can set it.
-# (Sourcing migrator.sh into this script makes BACKUP_DIR visible already;
-#  this line is documentation, not a fresh declaration.)
-# BACKUP_DIR is set in parse_args() below.
+# BACKUP_DIR is read by backup_path_for() (from backup.sh). validate.sh sets
+# it in parse_args() below; it needs no pre-declaration.
 
 # =============================================================================
 #                              COLOURS
@@ -394,23 +398,7 @@ run_per_row_checks() {
     declare -A new_for
     declare -A bkp_for
     declare -A ts_for
-
-    local orig newp bkp ts status
-    local tmp_log
-    tmp_log=$(mktemp)
-    tail -n +2 "$TRACKING_FILE" > "$tmp_log"
-    while IFS=, read -r orig newp bkp ts status; do
-        orig=$(csv_strip_field "$orig")
-        newp=$(csv_strip_field "$newp")
-        bkp=$(csv_strip_field "$bkp")
-        ts=$(csv_strip_field "$ts")
-        status=$(csv_strip_field "$status")
-        latest_status["$orig"]="$status"
-        new_for["$orig"]="$newp"
-        bkp_for["$orig"]="$bkp"
-        ts_for["$orig"]="$ts"
-    done < "$tmp_log"
-    rm -f "$tmp_log"
+    tracking_load_latest "$TRACKING_FILE" latest_status new_for bkp_for ts_for
 
     local total=0
     local path

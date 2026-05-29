@@ -153,9 +153,15 @@ phase_validate_rollback() {
 
     _check_one() {
         local _name="$1" mock_path="$2" _ts="$3"
-        # Reverse-map mock path to its source equivalent.
+        # Reverse-map mock path to its source equivalent. mock_build built
+        # mock_path as MOCK_ROOT + the ORIGINAL absolute source path, so
+        # stripping MOCK_ROOT already yields that source path. (The previous
+        # code prepended SOURCE_ROOT again, doubling it to
+        # /applications/opc_d2/applications/opc_d2/... so every row hit
+        # "source missing" and the rollback check passed vacuously — a
+        # false green. See bug A.)
         local rel="${mock_path#${MOCK_ROOT}}"
-        local src_path="${SOURCE_ROOT}${rel}"
+        local src_path="$rel"
         if [ ! -e "$src_path" ] && [ ! -L "$src_path" ]; then
             warn "  source missing (cannot compare): $src_path"
             return

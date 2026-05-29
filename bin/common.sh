@@ -16,7 +16,7 @@
 #     - Logging          : log, die, warn, info, success
 #     - CSV              : csv_strip_field, csv_read_3col
 #     - Path safety      : normalize_path, assert_under_root
-#     - Mapping helpers  : derive_reverse_map, apply_path_mapping
+#     - Mapping helpers  : apply_path_mapping
 #     - Sed safety       : sed_escape_literal, sed_escape_replacement,
 #                          replace_content_in_file
 #     - Lstat            : lstat_mtime_epoch, lstat_mtime_human, lstat_type,
@@ -155,6 +155,16 @@ csv_read_3col() {
         name="$(csv_strip_field "$name")"
         path="$(csv_strip_field "$path")"
         ts="$(csv_strip_field "$ts")"
+        # Skip blank / whitespace-only / path-less rows. A stray empty line or
+        # a trailing blank line would otherwise hand the callback an empty
+        # path, which migrator/mock_build reject via assert_under_root —
+        # aborting the entire run mid-way. A row with no Absolute_Path has
+        # nothing to act on; warn only if other columns were present (so a
+        # genuinely blank line stays silent, a malformed row is surfaced).
+        if [ -z "$path" ]; then
+            [ -n "$name$ts" ] && warn "csv_read_3col: skipping row with empty Absolute_Path (name='$name')"
+            continue
+        fi
         "$callback" "$name" "$path" "$ts"
     done < "$parsed_file"
     rm -f "$parsed_file"
@@ -201,23 +211,8 @@ assert_under_root() {
 # use eval-based indirection; callers pass the NAME of an associative array.
 # The eval'd contents are array keys/values declared in trusted source
 # files, not user input, so the usual eval injection concerns don't apply.
-
-# derive_reverse_map <forward_map_name> <reverse_map_name>
-# Populates <reverse_map_name> with key/value pairs swapped from
-# <forward_map_name>. Caller must declare the reverse map first as
-# `declare -A REVERSE_MAP`.
-derive_reverse_map() {
-    local fwd="$1"
-    local rev="$2"
-
-    local keys
-    eval "keys=( \"\${!${fwd}[@]}\" )"
-    local key value
-    for key in "${keys[@]}"; do
-        eval "value=\${${fwd}[\"\$key\"]}"
-        eval "${rev}[\"\$value\"]=\"\$key\""
-    done
-}
+# (tracking.sh's tracking_load_latest() uses the same idiom to populate
+# caller-named result arrays.)
 
 # apply_path_mapping <path> <map_name>
 # Echoes <path> with all keys of <map_name> substituted by their values.

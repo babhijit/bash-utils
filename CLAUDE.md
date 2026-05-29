@@ -14,13 +14,17 @@ All scripts live in `bin/`. There is no `bin/lib/` subdirectory because the oper
 
 ```text
 bin/
-├── common.sh                  ← shared library (sourced by everyone)
+├── common.sh                  ← generic shared library (logging, CSV, lstat, path safety, sed-safe rewrite)
+├── migration_map.sh           ← passive DATA: MIGRATION_MAP — sourced by migrator, finder, validate
+├── tracking.sh                ← tracking-file contract + tracking_load_latest() reader
+├── backup.sh                  ← backup-tree layout: backup_path_for() + backup_cp()
 ├── finder.sh                  ← discover fat1-style references in a tree
 ├── csv_reduce.sh              ← reduce finder's 5-col CSV to migrator's 3-col
 ├── selective_copy.sh          ← two-stage cross-user copy via /tmp
 ├── mock_build.sh              ← build a sandbox from a CSV (smart selective copy)
 ├── migrator.sh                ← stateful path/content rewriter with backup/resume/rollback
 ├── validate.sh                ← post-migration consistency checker
+├── fix_dir_mtimes.sh          ← repair directory mtimes bumped by renames (post-migration)
 ├── setup_migrator_test.sh     ← orchestrator: mock_build → migrator → validate → rollback
 ├── setup_finder_test.sh       ← (legacy) mock env for finder
 ├── setup_linux_test.sh        ← (legacy) mock env for selective_copy
@@ -28,7 +32,7 @@ bin/
 └── run_all_tests.sh           ← synthetic end-to-end smoke; no fat1/fat2 dependency
 ```
 
-`lib/` and `tests/{fixtures,mocks}/` are now unused placeholders. `tests/cases/fat2.csv` is the real input CSV used during development and as the canonical example.
+`migration_map.sh`, `tracking.sh`, and `backup.sh` are **library modules**, not executables — data and contracts shared by the tools so that **no tool sources another tool**. (finder/validate used to `source migrator.sh` just to borrow `MIGRATION_MAP` / `backup_path_for`, which inverted the pipeline dependency and pulled migrator's entire function set into their namespaces.) `lib/` and `tests/mocks/` are unused placeholders. `tests/cases/fat2.csv` is the real input CSV (canonical example); `tests/run_container_tests.sh` materializes a source tree from it and runs the full pipeline, and `tests/edge_cases.sh` is an adversarial edge battery — both run inside a bash-4.2.46 + GNU-coreutils container (`centos:7`), which is the only faithful way to exercise these GNU-only scripts off the target host.
 
 ## The two pipelines
 
@@ -157,15 +161,17 @@ This makes resume safe regardless of when the kill happened. The only invariant 
 
 ## Configuration-as-code (intentional)
 
-`MIGRATION_MAP` in `migrator.sh` is the single source of truth for forward mappings (`fat1 → fat2`, `opc_d1 → opc_d2`, etc.). The reverse map is derived at runtime via `derive_reverse_map` in common.sh — no duplicate-and-drift.
+`MIGRATION_MAP` lives in `migration_map.sh` — a **passive data module** that declares the associative array and nothing else (no functions, no `main`). It is the single source of truth for forward mappings (`fat1 → fat2`, `opc_d1 → opc_d2`, etc.). `migrator.sh`, `finder.sh`, and `validate.sh` each `source migration_map.sh`; **none of them sources another tool.**
 
-`finder.sh` sources `migrator.sh` to get the same `MIGRATION_MAP`. Its `NAME_SEARCH_PATTERNS` and `CONTENT_SEARCH_PATTERNS` are just `"${!MIGRATION_MAP[@]}"`. Anything finder finds is something migrator can rewrite, by construction.
+`finder.sh`'s `NAME_SEARCH_PATTERNS` and `CONTENT_SEARCH_PATTERNS` are just `"${!MIGRATION_MAP[@]}"`. Because finder and migrator read the *same* array, anything finder finds is something migrator can rewrite, by construction — the invariant the old "finder sources migrator" coupling protected, now kept without the inverted dependency or the function-namespace bleed it caused.
 
-Adding a new pattern is a single edit to `MIGRATION_MAP`. The map is `declare -Ar` (associative + readonly). Note: `declare -A readonly NAME=(...)` is a latent bug (bash parses `readonly` as a separate identifier and `NAME` is NOT actually readonly). The `-Ar` form is the correct shorthand and is documented inline.
+There is no reverse map: the old `REVERSE_MIGRATION_MAP` (derived via `derive_reverse_map`) was never consumed anywhere, so both were dropped (YAGNI). Derive it at the point of use if a reverse migration is ever needed.
+
+Adding a new pattern is a single edit to `migration_map.sh`. The map is `declare -Ar` (associative + readonly). Note: `declare -A readonly NAME=(...)` is a latent bug (bash parses `readonly` as a separate identifier and `NAME` is NOT actually readonly). The `-Ar` form is the correct shorthand and is documented inline.
 
 ## Bash 4.2 idioms to preserve
 
-The host runs bash 4.2.46 (RHEL 7 era). Namerefs (`declare -n`) require 4.3+, so they cannot be used. `common.sh` uses **`eval`-based associative-array indirection** in three helpers — `derive_reverse_map`, `apply_path_mapping`, `replace_content_in_file`. The eval'd arguments are array names from trusted source files (no user input), so the usual injection concerns don't apply. Don't "modernize" this without bumping the version floor and updating `require_bash_version` calls.
+The host runs bash 4.2.46 (RHEL 7 era). Namerefs (`declare -n`) require 4.3+, so they cannot be used. **`eval`-based associative-array indirection** stands in for namerefs wherever a function must read or populate a caller-named array: `apply_path_mapping` and `replace_content_in_file` in `common.sh`, and `tracking_load_latest` in `tracking.sh` (which populates four caller-declared result arrays — collapsing five copy-pasted parse loops into one). The eval'd arguments are array names from trusted source files (no user input), so the usual injection concerns don't apply. Don't "modernize" this without bumping the version floor and updating `require_bash_version` calls. The suite is verified on real bash 4.2.46 + GNU coreutils via the `centos:7` container harnesses.
 
 ## Shell hygiene patterns (don't drop these when editing)
 
@@ -174,9 +180,11 @@ The host runs bash 4.2.46 (RHEL 7 era). Namerefs (`declare -n`) require 4.3+, so
 - **`local count=$((count + 1))`** instead of `((count++))` — the latter returns exit 1 on the first call and is killed by `set -e`.
 - **Process substitution** `done < <(find ... -print0)` instead of `find ... | while read` — pipes run the while loop in a subshell and silently drop any state set inside.
 - **`grep -v ... || true`** when filtering tracking files. If every line matches, grep exits 1 and pipefail kills the script — the `|| true` is load-bearing.
-- **`if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi`** at the bottom of every executable script so other scripts can source it without firing `main`. `finder.sh` and `validate.sh` source `migrator.sh` to access `MIGRATION_MAP` and `backup_path_for`.
+- **`if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then main "$@"; fi`** at the bottom of every executable script so it can be sourced without firing `main`. The tools no longer source each other — they source the `migration_map.sh` / `tracking.sh` / `backup.sh` library modules, which carry an idempotent-source guard (`[ -n "${_X_SH:-}" ] && return 0`) and define data/functions only, no `main`.
 - **`replace_content_in_file`** in common.sh writes via `cat tmp > file`, not `mv tmp file`. This preserves the original inode's perms/owner/ACL/timestamps. mtime is bumped (and must be restored by the caller from the recorded original).
 - **Backup directory mirrors the original tree shape**, not basename + epoch. Collisions are impossible regardless of name overlap and rollback is structural rather than tracking-dependent.
+- **`csv_read_3col` skips rows with an empty `Absolute_Path`** (blank or whitespace-only lines, a trailing newline). Without this, an empty field reaches `assert_under_root ""` and `die`s mid-run — one stray blank line would abort the entire migration. (Bug B.)
+- **`migrate_directory` renames inner entries, not just file contents.** When a directory row is renamed, a descendant that is also its own CSV row has a now-stale path and its row is skipped — so the directory walk is the only place that descendant's NAME can be migrated. It processes deepest-first within the directory (a rename never invalidates a deeper path) and the directory's backup is taken first, so rollback stays faithful. (Bug C.)
 
 ## Running
 

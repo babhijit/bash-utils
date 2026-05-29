@@ -13,9 +13,11 @@
 #   grep -i). Follows symbolic links (-L) so a single tree with a symlink
 #   into another part of the FS is fully covered.
 #
-#   PATTERNS COME FROM migrator.sh's MIGRATION_MAP, sourced at startup. This
-#   guarantees finder searches for exactly the things migrator can rewrite —
-#   no risk of finder finding a pattern migrator won't handle, or vice versa.
+#   PATTERNS COME FROM migration_map.sh's MIGRATION_MAP — the shared data
+#   module migrator also reads. This guarantees finder searches for exactly
+#   the things migrator can rewrite (no risk of finder finding a pattern
+#   migrator won't handle, or vice versa) WITHOUT finder depending on
+#   migrator.sh itself.
 #
 # Modes:
 #   --mode name     Match by basename only.
@@ -47,12 +49,14 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
-# Source migrator.sh for MIGRATION_MAP. Its sourcing guard prevents main()
-# from running when sourced.
-# shellcheck source=migrator.sh
-source "${SCRIPT_DIR}/migrator.sh"
-# Floor is 4.2 (not 4.0): migrator.sh's `declare -Ar` requires 4.2, and
-# finder uses `${var,,}` lower-casing which requires 4.0. Match migrator.
+# MIGRATION_MAP comes from the shared passive data module — NOT from
+# migrator.sh. finder runs UPSTREAM of migrator; sourcing the migrator
+# executable just to borrow its map inverted the pipeline dependency and
+# pulled every migrator function into finder's namespace.
+# shellcheck source=migration_map.sh
+source "${SCRIPT_DIR}/migration_map.sh"
+# Floor is 4.2: migration_map.sh's `declare -Ar` requires 4.2, and finder
+# uses `${var,,}` lower-casing which requires 4.0.
 require_bash_version 4 2
 set -euo pipefail
 
@@ -60,7 +64,7 @@ set -euo pipefail
 #                                 CONFIGURATION
 # =============================================================================
 #
-# Patterns are the KEYS of MIGRATION_MAP (from migrator.sh). Both name and
+# Patterns are the KEYS of MIGRATION_MAP (from migration_map.sh). Both name and
 # content searches use the same set — anything finder finds is something
 # migrator can rewrite, by construction.
 
@@ -129,7 +133,7 @@ Arguments:
   --minimal   Emit 3-column CSV (Name,Absolute_Path,Last_Modified) suitable
               for migrator.sh, instead of the default 5-column diagnostic form.
 
-Patterns are taken from migrator.sh's MIGRATION_MAP keys.
+Patterns are taken from migration_map.sh's MIGRATION_MAP keys.
 EOF
     exit 1
 }

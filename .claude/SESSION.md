@@ -1,128 +1,57 @@
 # SESSION
 
-Last Updated: 2026-05-25 (Asia/Kolkata)
-Branch: main
-Tag at handoff: `first-draft`
+Last Updated: 2026-05-29 (Asia/Kolkata)
+Branch: main  (refactor + fixes are UNCOMMITTED in the working tree)
 Remote: `git@github.com:babhijit/bash-utils.git`
-Current Focus: Verifying the refactored migration suite end-to-end on a Linux host. The code is feature-complete from the macOS side but UNVERIFIED — none of the GNU-coreutils-dependent paths have been executed.
+Current Focus: Architectural refactor (decouple finder/validate from migrator) + edge-case bug fixes, verified end-to-end on real bash 4.2.46 + GNU coreutils.
 
 ## Status
 
-Major refactor complete. All 8 structural issues from the earlier code review are addressed, plus the four hard DR requirements (backup, validate, resume, rollback+cleanup). The suite is reorganized into a flat `bin/` hierarchy with a shared `common.sh` library. Tagged `first-draft` on commit.
-
-Next person to pick up: run `bash bin/run_all_tests.sh` on Linux. If it passes, the implementation is functionally correct and ready for mock-rehearsal against the real fat2 tree.
+Done and **verified green on `centos:7` (bash 4.2.46 + GNU coreutils)** — the exact target runtime. Not yet committed. The earlier "unverified on Linux" gap from the 2026-05-25 handoff is now closed: the suite has been executed, not just written.
 
 ## Completed This Session
 
-- **bin/common.sh (new)** — shared utilities: structured logging, quote-aware CSV parser, sed-safe literal content replacement, `--root` assertion, lstat helpers, tmpfs warning, 5-second confirmation gate, run-id generator. No `/tmp` defaults baked in; all callers set their own.
+- **Decoupling (the headline).** `finder.sh` and `validate.sh` no longer `source migrator.sh`. The migration map moved out of `migrator.sh` into a new passive data module that all three tools read. No tool sources another tool — this removes both the inverted pipeline dependency (finder ran upstream yet depended on migrator) and the function-namespace bleed (sourcing migrator dumped `process_row`, `run_execute`, a second `run_validate`, etc. into the consumer, resolved only by definition order).
 
-- **bin/migrator.sh (rewrite)** — required `--root` guard with `assert_under_root` per CSV row, `--workdir` defaulting to `/tmp/migration_f2`, append-only tracking at `<workdir>/progress.log`, resume model where `BACKED_UP`-but-not-`COMPLETED` rows trigger restore-from-backup then re-execute, single `MIGRATION_MAP` with reverse derived at runtime, sed-safe content rewrite, child-file mtime restore inside directory walks, `--dry-run` that's also resume-safe, `--yes` + 5-second countdown for non-`/tmp` roots, backup tree mirroring original tree shape (no collisions).
+- **New library modules (`bin/`):**
+  - `migration_map.sh` — passive data; declares `MIGRATION_MAP`, nothing else. Idempotent-source guard.
+  - `tracking.sh` — tracking-file contract (header/append/latest/field) **plus `tracking_load_latest`**, which collapsed **5 copy-pasted "tail+while-read" parse loops** (migrator ×4, validate ×1) into one eval-indirection reader.
+  - `backup.sh` — `backup_path_for()` (the backup-tree layout contract, shared with validate) + `backup_cp()`.
+  - Dropped dead `REVERSE_MIGRATION_MAP` + `derive_reverse_map` (derived-but-never-consumed; YAGNI).
 
-- **bin/finder.sh (refactor)** — now sources `migrator.sh` for `MIGRATION_MAP` keys (single source of truth), fixed `-name` → `-iname` in prune (case-insensitive throughout), dedupes by absolute path before emitting, `--minimal` flag for 3-col output suitable for migrator.
+- **Bug fixes (found by the edge battery against the *current* scripts, then fixed):**
+  - **A** — `setup_migrator_test.sh` validate-rollback built a doubled source path (`…/opc_d2/applications/opc_d2/…`) → compared 0 rows → false-green "rollback restored". Fixed: strip MOCK_ROOT yields the original path directly (no SOURCE_ROOT re-prepend). Now `pass=114`.
+  - **B** — a blank/whitespace CSV line hit `assert_under_root ""` → `die` → aborted the whole run mid-way. Fixed in `common.sh:csv_read_3col` (skip empty-Absolute_Path rows).
+  - **C** — directory-rename row + descendant row: descendant's NAME was never migrated (stale path → silent skip, untracked). Fixed in `migrate_directory` (renames inner entries deepest-first, content + basename, mtime-preserving). Rollback stays faithful because the dir's backup is taken first.
 
-- **bin/mock_build.sh (new)** — the "smart selective copy". Reads a 3-col CSV, copies LIVE paths from `--source-root` to `--mock-root` (default `/tmp/mock_f2`), per-copy `verify_lstat_match`, refuses if `--mock-root` is under `--source-root`, emits `mock_input.csv` for migrator. Idempotent: re-runs skip rows whose mock copy is already lstat-verified.
+- **Test harnesses (new, `tests/`):** `run_container_tests.sh` (materializes a tree from `fat2.csv`, runs mock_build→migrator→validate→rollback→validate-rollback) and `edge_cases.sh` (7 adversarial cases E1–E7). Both run via `docker run --rm -v "$PWD":/work -w /work centos:7 bash tests/<x>.sh`.
 
-- **bin/validate.sh (new)** — standalone post-migration consistency check. For every COMPLETED row: migrated path exists, backup exists, mtime matches recorded ts, lstat type matches backup, content equals expected rewrite of backup, symlink target matches expected. Optional `--scan-root` for tree-wide residual fat1 reference scan (informational).
+- **CLAUDE.md** updated: flat-layout tree, the "Configuration-as-code" section (map now in migration_map.sh, reverse dropped), bash-4.2 idioms (eval-indirection now incl. tracking_load_latest), hygiene bullets for fixes B and C.
 
-- **bin/setup_migrator_test.sh (rewrite)** — thin orchestrator. Delegates to `mock_build.sh` → `migrator.sh` → `validate.sh` → rollback → `validate-rollback` (diffs rolled-back mock against original source bit-for-bit) → cleanup. No duplicated logic.
+## Verification (all on bash 4.2.46)
 
-- **bin/selective_copy.sh (refactor)** — `mktemp -d /tmp/scopy.XXXXXX` per-run staging (no more shared `/tmp/selective_copy_stage`), tab-separated state file (handles paths with spaces), `--shared-group` flag for 2770 + setgid alternative to chmod 777, `--source-user` / `--target-user` identity sanity checks, state-file tamper detection (newest-inner-file vs state-file mtime), new `--mode cleanup`.
-
-- **bin/csv_reduce.sh (new)** — collapses finder's 5-col diagnostic CSV to migrator's 3-col format, deduped by absolute path. Idempotent on 3-col input.
-
-- **bin/run_all_tests.sh (new)** — synthetic end-to-end smoke. Builds its own source tree under `/tmp/run_all_tests.<pid>/` exercising file/dir/symlink, runs the full pipeline including resume-no-op and rollback. No fat1/fat2 dependency.
-
-- **CLAUDE.md (rewrite)** — documents both pipelines (live + mock), the four hard requirements with their implementations, the `/tmp` constraint, `--root` guard, resume model, bash 4.2 idioms, the flat layout convention.
-
-- **docs/DIAGNOSE_WORKFLOW.md** — annotated as historical at the top; original content preserved as a template for future remote-diagnose situations. Not committed (covered by `.gitignore`'s `docs/` rule).
-
-## Critical Verification Gap
-
-Everything was written on macOS. None of the GNU-coreutils-dependent code paths (`stat -c`, `touch -d "@epoch"`, `find -printf`, `df --output=`) have been executed. The implementation could have a typo or a wrong flag and we wouldn't know.
-
-**First action on Linux: `bash bin/run_all_tests.sh`**. If that passes, everything important works.
+- `bash -n`: clean across all `bin/` + `tests/`.
+- `bin/run_all_tests.sh`: ALL TESTS PASSED.
+- `tests/edge_cases.sh`: 15/15 PASS.
+- `tests/run_container_tests.sh`: forward validate 84/84; rollback 84; validate-rollback `pass=114 fail=0`.
 
 ## In Progress
 
-Nothing actively in progress. Refactor is at a clean checkpoint.
+Nothing. Clean checkpoint.
 
-## Next Steps (priority order)
+## Next Steps
 
-1. **Smoke test on Linux**: `bash bin/run_all_tests.sh`. Expect "ALL TESTS PASSED" at the end. If anything fails, the error message + stderr should point at the broken bit.
-2. **Mock rehearsal against real fat2 tree** (only after #1 passes):
-
-   ```bash
-   bash bin/setup_migrator_test.sh --mode all \
-       --csv tests/cases/fat2.csv \
-       --source-root /applications/opc_d2
-   ```
-
-3. **Live migration** (only after #2 passes including `validate-rollback`):
-
-   ```bash
-   bash bin/migrator.sh --mode execute \
-       --root /applications/opc_d2 \
-       --csv tests/cases/fat2.csv \
-       --workdir /tmp/migration_f2 \
-       --yes
-   ```
-
-4. **Post-live validate**:
-
-   ```bash
-   bash bin/validate.sh --root /applications/opc_d2 \
-       --workdir /tmp/migration_f2 \
-       --scan-root /applications/opc_d2
-   ```
+1. **Commit** the refactor + fixes (branch off `main` first) — not yet done; awaiting go-ahead.
+2. **Confirm on the real RHEL7 host**: run the same two harnesses there (true target; centos:7 is a close proxy).
+3. **Resume the migration-run prep** that was paused to do this refactor: adapt `selective_copy.sh` for THIS job (its config still targets `/home/xbapp_d1`→`/home/xbapp_d2` with a 2-item COPY_MAPPING, NOT the `/applications/opc_d1`→`opc_d2` app tree), and settle the `/tmp/test_f2/bin` deploy + single shared staging dir. Roles confirmed: **opc_d1 = source/FAT1, opc_d2 = target/FAT2.**
 
 ## Blockers
 
-- **No Linux access from macOS side**, hence the verification gap.
-- **`/tmp` is the only writable shared location** on the live host — backups are tmpfs-vulnerable. CLAUDE.md flags this and `check_tmpfs_warning` warns at runtime, but operator discipline (one continuous session, validate before logout) is the only real mitigation.
+- None. Docker `centos:7` is the local test proxy; the real host is ground truth.
 
 ## Key Decisions
 
-- **Flat hierarchy in `bin/`** — no `bin/lib/`, no `bin/utils/` subdir. Operator deploys everything to a single workdir; all sources resolve via `dirname "${BASH_SOURCE[0]}"`.
-- **`/tmp/migration_f2/` as canonical workdir** (not per-run unique). Re-running migrator with the same `--workdir` resumes from the tracking file. To start over, `--mode cleanup` first.
-- **`--root` is REQUIRED on migrator** and asserted against every CSV row. The single load-bearing defense against accidentally pointing at fat1.
-- **Bash 4.2 floor** preserved. Eval-based associative-array indirection in `common.sh` (no namerefs). Documented inline.
-- **Resume by restore-then-redo, not by step-tracking.** `BACKED_UP`-but-not-`COMPLETED` rows always restore from backup before retrying. Backup is the only invariant.
-- **Backup tree mirrors original tree shape** under `<workdir>/backups/`. Collisions impossible regardless of basename overlap.
-- **`docs/` is gitignored** (per pre-existing `.gitignore`) — `DIAGNOSE_WORKFLOW.md` stays local-only.
-
-## Repo State Reference
-
-```text
-bash-utils/
-├── CLAUDE.md                            ← refactored, documents both pipelines
-├── .claude/SESSION.md                   ← this file
-├── .gitignore                           ← pre-existing; excludes docs/, *.log
-├── bin/
-│   ├── common.sh                        NEW
-│   ├── finder.sh                        REFACTOR
-│   ├── csv_reduce.sh                    NEW
-│   ├── selective_copy.sh                REFACTOR
-│   ├── mock_build.sh                    NEW
-│   ├── migrator.sh                      REWRITE
-│   ├── validate.sh                      NEW
-│   ├── setup_migrator_test.sh           REWRITE (thin orchestrator)
-│   ├── setup_finder_test.sh             unchanged (legacy)
-│   ├── setup_linux_test.sh              unchanged (legacy)
-│   ├── diagnose_migrator_bug.sh         unchanged (legacy)
-│   └── run_all_tests.sh                 NEW
-├── docs/DIAGNOSE_WORKFLOW.md            UNCOMMITTED (gitignored), annotated historical
-├── lib/                                 unused placeholder (.gitkeep)
-└── tests/
-    ├── cases/fat2.csv                   the real test input
-    ├── fixtures/                        placeholder
-    └── mocks/                           placeholder
-```
-
-## Resume Hints for Future Claude
-
-- **Run `bash bin/run_all_tests.sh` first.** That's the canonical "is this implementation correct" check. Don't spend time auditing code if the smoke test passes.
-- **If `run_all_tests.sh` fails on Linux**, the error will name a specific assertion (`mtime preserved (label)`, `exists`, `lacks 'FAT1'`, etc.) — that points at which phase broke. Read the relevant function in migrator.sh / mock_build.sh / common.sh.
-- **`migrator.sh` sources are intentional**: `finder.sh` and `validate.sh` source it to get `MIGRATION_MAP` and `backup_path_for()`. The sourcing guard at the bottom prevents `main` from firing.
-- **bash 4.2** — do not introduce `declare -n` or `${var@operator}` or other 4.3+ features without a discussion.
-- **`/tmp` is non-negotiable as the only writable shared location.** Don't propose `$HOME` or `/var/tmp` alternatives.
-- **No `Co-Authored-By: Claude` on commits.** Per the user's global CLAUDE.md.
+- **Tier 3 ("unify the 3 validators") SKIPPED** — the real duplication (tracking-parse) was already removed by Tier 2; the three validators check genuinely different post-conditions (forward = matches expected REWRITE; rollback = matches backup EXACTLY; `--mode validate` = fast 3-check), so merging their logic would be artificial. Only ~20 lines of presentation overlap remained, one consumer untested. YAGNI.
+- **Fix C via `migrate_directory` inner-rename, NOT literal deepest-first row reordering.** Literal child-before-parent ordering would make the parent's backup capture already-mutated children → stray files on rollback. Letting the directory migration handle its own descendants achieves correct renaming with no backup-model change. (finder emits parents before children, and the real fat2.csv dir-children carry no fat1 tokens, so this changes nothing for the real data.)
+- **bash 4.2 floor preserved**; verified on actual 4.2.46.
+- **No `Co-Authored-By: Claude`** on commits (per global CLAUDE.md).
