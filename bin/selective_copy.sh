@@ -289,9 +289,10 @@ run_prepare() {
         info "Staging regular items..."
         for item_map in "${COPY_MAPPING[@]}"; do
             IFS='|' read -r src_name dest_name <<< "${item_map}"
+            src_name="${src_name%/}"; dest_name="${dest_name%/}"   # normalize trailing /
             full_src_path="${SOURCE_BASE_DIR}/${src_name}"
             stage_dest_path="${STAGING_DIR}/${dest_name}"
-            if [ ! -e "$full_src_path" ]; then
+            if [ ! -e "$full_src_path" ] && [ ! -L "$full_src_path" ]; then
                 warn "Source missing, skipping: $full_src_path"
                 continue
             fi
@@ -309,10 +310,21 @@ run_prepare() {
                 fi
             done
             info "Staging: $full_src_path -> $stage_dest_path"
-            # Same bash-4.2 empty-array guard: most items match no exclude rule,
-            # so rsync_exclude_args is usually empty.
-            if ! rsync -a "${rsync_exclude_args[@]+"${rsync_exclude_args[@]}"}" "$full_src_path" "$stage_dest_path"; then
-                die "rsync failed: $full_src_path -> $stage_dest_path"
+            safe_mkdir_p "$(dirname "$stage_dest_path")"
+            # Copy so the item lands AT dest_name (rename-capable), NOT nested
+            # inside it. For a directory, trailing slashes on BOTH sides copy the
+            # CONTENTS into dest (so /src/bin -> STAGING/<dest>, not
+            # STAGING/<dest>/bin). For a file/symlink, copy to the dest path.
+            # (rsync_exclude_args guarded for the same bash-4.2 empty-array reason.)
+            if [ -d "$full_src_path" ] && [ ! -L "$full_src_path" ]; then
+                safe_mkdir_p "$stage_dest_path"
+                if ! rsync -a "${rsync_exclude_args[@]+"${rsync_exclude_args[@]}"}" "$full_src_path/" "$stage_dest_path/"; then
+                    die "rsync failed: $full_src_path -> $stage_dest_path"
+                fi
+            else
+                if ! rsync -a "${rsync_exclude_args[@]+"${rsync_exclude_args[@]}"}" "$full_src_path" "$stage_dest_path"; then
+                    die "rsync failed: $full_src_path -> $stage_dest_path"
+                fi
             fi
         done
     fi
@@ -409,16 +421,19 @@ run_deploy() {
         info "Deploying regular items..."
         for item_map in "${COPY_MAPPING[@]}"; do
             IFS='|' read -r src_name dest_name <<< "$item_map"
+            dest_name="${dest_name%/}"   # normalize, matching prepare
             stage_src_path="${STAGING_DIR}/${dest_name}"
             final_dest_path="${TARGET_BASE_DIR}/${dest_name}"
-            if [ ! -e "$stage_src_path" ]; then
+            if [ ! -e "$stage_src_path" ] && [ ! -L "$stage_src_path" ]; then
                 warn "Staged item missing: $stage_src_path"
                 continue
             fi
             if [ -d "$stage_src_path" ] && [ ! -L "$stage_src_path" ]; then
                 safe_mkdir_p "$final_dest_path"
-                info "Deploying dir: $stage_src_path/ -> $final_dest_path"
-                rsync -a "$stage_src_path/" "$final_dest_path" || die "rsync failed for $stage_src_path"
+                info "Deploying dir: $stage_src_path/ -> $final_dest_path/"
+                # Trailing slash on src + dest dir => contents land directly
+                # under final_dest_path (no nesting), mirroring prepare.
+                rsync -a "$stage_src_path/" "$final_dest_path/" || die "rsync failed for $stage_src_path"
             else
                 safe_mkdir_p "$(dirname "$final_dest_path")"
                 info "Deploying: $stage_src_path -> $final_dest_path"

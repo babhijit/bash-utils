@@ -58,6 +58,7 @@ echo "should be excluded"    > "$SRC/bin/debug.log"
 echo "rc_art opc_d1"         > "$SRC/etc/rc_art"
 echo "jks tomc"              > "$SRC/security/jks.tomc.inf"
 touch -d "$TS" "$SRC/bin/bld.setenv" "$SRC/etc/rc_art" "$SRC/security/jks.tomc.inf"
+touch -d "$TS" "$SRC/bin" "$SRC/etc" "$SRC/security"   # dir mtimes too (test preservation)
 chown -R srcu:srcu "$SRC"
 chown -R tgtu:tgtu "$TGT"
 
@@ -75,7 +76,8 @@ chmod 644 "$CONF"
 echo ""; echo "=== PREPARE (as srcu) ==="
 su srcu -c "bash '$SC' --mode prepare --config '$CONF' --source-user srcu --target-user tgtu" 2>&1 | sed 's/^/    /' || echo "    (prepare exit=$?)"
 [ -d /tmp/test_f2/migration ] && ok "fixed staging dir created from config (/tmp/test_f2/migration)" || no "fixed staging dir NOT created"
-[ -n "$(have /tmp/test_f2/migration bld.setenv)" ] && ok "bin/bld.setenv staged" || no "bld.setenv not staged"
+[ -f /tmp/test_f2/migration/bin/bld.setenv ] && ok "bld.setenv staged at staging/bin/ (not nested)" || no "bld.setenv not staged correctly"
+[ ! -e /tmp/test_f2/migration/bin/bin ] && ok "staging not nested (bin/bin absent)" || no "staging NESTED (bin/bin exists)"
 [ -z "$(have /tmp/test_f2/migration debug.log)" ] && ok "EXCLUDE_MAPPING worked (debug.log not staged)" || no "EXCLUDE_MAPPING failed (debug.log staged)"
 echo "  staging tree:"; find /tmp/test_f2/migration -printf '    %y %p\n' 2>/dev/null | grep -v permissions.state | head -30
 
@@ -88,20 +90,17 @@ fi
 
 echo ""; echo "=== DEPLOY (as tgtu) ==="
 su tgtu -c "bash '$SC' --mode deploy --config '$CONF' --target-user tgtu --staging-dir /tmp/test_f2/migration" 2>&1 | sed 's/^/    /' || echo "    (deploy exit=$?)"
-dep_bld=$(have "$TGT" bld.setenv)
-dep_rc=$(have "$TGT" rc_art)
-dep_jks=$(have "$TGT" jks.tomc.inf)
-[ -n "$dep_bld" ] && ok "deployed bld.setenv -> $dep_bld" || no "bld.setenv not deployed"
-[ -n "$dep_rc" ]  && ok "deployed rc_art -> $dep_rc"      || no "rc_art not deployed"
-[ -n "$dep_jks" ] && ok "deployed jks.tomc.inf"           || no "jks.tomc.inf not deployed"
-if [ -n "$dep_bld" ]; then
-    owner=$(stat -c '%U' "$dep_bld")
-    [ "$owner" = "tgtu" ] && ok "deployed file owned by tgtu" || no "deployed file owner=$owner (expected tgtu)"
-fi
-if [ -n "$dep_rc" ]; then
-    m=$(stat -c '%Y' "$dep_rc")
-    [ "$m" = "$TS_EPOCH" ] && ok "mtime preserved on rc_art ($m)" || no "mtime drift on rc_art (have $m want $TS_EPOCH)"
-fi
+# No nesting: items land at TARGET/<dest>/..., NOT TARGET/<dest>/<dest>/...
+[ -f "$TGT/bin/bld.setenv" ]        && ok "bld.setenv at TARGET/bin/ (not nested)"  || no "bld.setenv missing at TARGET/bin/"
+[ ! -e "$TGT/bin/bin" ]             && ok "no double-nest (TARGET/bin/bin absent)"  || no "STILL NESTED: TARGET/bin/bin exists"
+[ -f "$TGT/etc/rc_art" ]            && ok "rc_art at TARGET/etc/"                    || no "rc_art missing at TARGET/etc/"
+[ -f "$TGT/security/jks.tomc.inf" ] && ok "jks.tomc.inf at TARGET/security/"         || no "jks.tomc.inf missing at TARGET/security/"
+owner=$(stat -c '%U' "$TGT/bin/bld.setenv" 2>/dev/null)
+[ "$owner" = "tgtu" ] && ok "deployed file owned by tgtu" || no "owner=$owner (expected tgtu)"
+fm=$(stat -c '%Y' "$TGT/etc/rc_art" 2>/dev/null)
+[ "$fm" = "$TS_EPOCH" ] && ok "file mtime preserved (rc_art=$fm)" || no "file mtime drift (have $fm want $TS_EPOCH)"
+dm=$(stat -c '%Y' "$TGT/bin" 2>/dev/null)
+[ "$dm" = "$TS_EPOCH" ] && ok "dir mtime preserved (bin=$dm)" || no "dir mtime drift on bin (have $dm want $TS_EPOCH)"
 echo "  target tree:"; find "$TGT" -printf '    %y %p\n' 2>/dev/null | head -30
 
 echo ""; echo "=== CLEANUP (as srcu, owns staging) ==="
