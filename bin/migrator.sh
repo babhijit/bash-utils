@@ -509,9 +509,9 @@ restore_from_backup() {
         return 1
     fi
 
-    # If the new (post-migration) path exists, remove it first. We don't
-    # know whether the original path or the new path is currently live, so
-    # remove both possibilities.
+    # Clear the locations we are about to overwrite, then restore. Remove the
+    # post-migration path (new_path) and the restore target (restore_to) if
+    # they are currently live.
     local new_path
     new_path="$(apply_path_mapping "$orig_path" MIGRATION_MAP)"
     if [ "$new_path" != "$orig_path" ] && { [ -e "$new_path" ] || [ -L "$new_path" ]; }; then
@@ -520,10 +520,12 @@ restore_from_backup() {
     if [ "$restore_to" != "$new_path" ] && { [ -e "$restore_to" ] || [ -L "$restore_to" ]; }; then
         rm -rf "$restore_to"
     fi
-    if [ "$orig_path" != "$new_path" ] && [ "$orig_path" != "$restore_to" ] && \
-       { [ -e "$orig_path" ] || [ -L "$orig_path" ]; }; then
-        rm -rf "$orig_path"
-    fi
+    # Deliberately do NOT remove orig_path. It differs from restore_to ONLY in
+    # the REDIRECT case (fat1_X and fat2_X coexisted; execute rewrote fat2_X in
+    # place and LEFT fat1_X untouched, so restore_to=fat2_X). orig_path is then
+    # the pre-existing fat1_X the migration never modified — deleting it on
+    # rollback would destroy a file that predated the migration, which is
+    # exactly what rollback must preserve. (Bug F.)
 
     if ! backup_cp "$bkp" "$restore_to"; then
         warn "cp -a failed restoring $restore_to from $bkp"
