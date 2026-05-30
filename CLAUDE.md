@@ -20,7 +20,7 @@ bin/
 ├── backup.sh                  ← backup-tree layout: backup_path_for() + backup_cp()
 ├── finder.sh                  ← discover fat1-style references in a tree
 ├── csv_reduce.sh              ← reduce finder's 5-col CSV to migrator's 3-col
-├── selective_copy.sh          ← two-stage cross-user copy via /tmp (config-driven: --config)
+├── selective_copy.sh          ← phased cross-user copy via /tmp (config-driven; batched under a /tmp cap)
 ├── selective_copy.conf.example ← sample job config for selective_copy.sh
 ├── mock_build.sh              ← build a sandbox from a CSV (smart selective copy)
 ├── migrator.sh                ← stateful path/content rewriter with backup/resume/rollback
@@ -44,11 +44,16 @@ bin/
        │
        │  (as fat1 user)
        ▼
-  selective_copy.sh --mode prepare       ← stages into /tmp/scopy.XXXX
+  selective_copy.sh --mode plan          ← bin-packs into <=budget batches (once)
        │
-       │  (as fat2 user)
+       │  (alternate the two logins, NO sync between them, until all DEPLOYED)
        ▼
-  selective_copy.sh --mode deploy        ← writes fat2 tree, restores lstat
+  selective_copy.sh --mode prepare  (fat1 user)  ← stages ONE batch into /tmp
+  selective_copy.sh --mode deploy   (fat2 user)  ← deploys it, restores attrs, drains /tmp
+       │
+       │  (as fat2 user, once)
+       ▼
+  selective_copy.sh --mode finalize      ← symlinks + transforms + dir-mtime reconcile
        │
        ▼
   fat2 tree  (/applications/opc_d2, identical to fat1 at this point)
@@ -121,7 +126,7 @@ These come from the DR brief; each script must respect them.
 
 | Requirement | Implementation |
 | --- | --- |
-| **Backup before every change** | `migrator.sh` uses `cp -a` per row before any mutation. Backup tree mirrors original tree shape under `<workdir>/backups/` — no basename collisions possible. `selective_copy.sh` stages via rsync into `mktemp -d` and records lstat for restore. |
+| **Backup before every change** | `migrator.sh` uses `cp -a` per row before any mutation. Backup tree mirrors original tree shape under `<workdir>/backups/` — no basename collisions possible; a free-space preflight (`du -sb` of the CSV paths vs `check_free_space_bytes`) aborts before the first backup if `<workdir>` can't hold the footprint. `selective_copy.sh` stages each batch via rsync and records original lstat to a per-batch reference CSV, restored on deploy. |
 | **Validate that the change happened** | `validate.sh` reads migrator's tracking file. For every COMPLETED row, checks: migrated path exists, backup exists, mtime matches recorded ts, lstat type matches backup, content equals expected rewrite of backup, symlink target matches expected. Tree-wide `--scan-root` looks for residual fat1 references. |
 | **Resume after mid-run kill** | Tracking file is append-only at `<workdir>/progress.log`. On restart, every `BACKED_UP`-but-not-`COMPLETED` row triggers restore-from-backup followed by re-execute. Backup is the source of truth; live path may be in any intermediate state. Re-running migrator with the same `--workdir` resumes automatically. |
 | **Rollback even after success** | `migrator.sh --mode rollback` walks tracking in reverse, restores each `COMPLETED` row from its backup, restores its mtime, appends `ROLLED_BACK` to tracking. `--mode cleanup` deletes backups + tracking. Mock pipeline includes a `validate-rollback` phase that diffs the rolled-back mock against the original source — bit-for-bit equivalence is the gate. |
@@ -132,7 +137,7 @@ The operator confirmed: `/tmp` is the only writable shared location. There is no
 
 - `migrator.sh`'s `--workdir` defaults to `/tmp/migration_f2/` (configurable).
 - `mock_build.sh`'s `--mock-root` defaults to `/tmp/mock_f2/`.
-- `selective_copy.sh` creates a `mktemp -d /tmp/scopy.XXXXXX` staging dir.
+- `selective_copy.sh` stages ONE batch at a time into `STAGING_DIR` and drains it after each deploy, so peak `/tmp` use never exceeds a single batch (`STAGING_BUDGET_BYTES`, default 950 MiB) — the load-bearing response to the ~1 GB `/tmp` hard cap vs ~7 GB of data. Its small `STATE_DIR` (plan, per-batch manifests, attribute CSVs, markers, logs) persists across batches and across both logins.
 - `common.sh:check_tmpfs_warning` warns loudly if the chosen dir is tmpfs (sweepers and reboot will lose backups).
 - **Recommended operator practice**: run the full forward + validate + decision-to-keep cycle in one continuous shell session. Don't let a tmpfiles.d sweeper or a reboot get between execute and validate.
 
@@ -176,7 +181,7 @@ The host runs bash 4.2.46 (RHEL 7 era). Namerefs (`declare -n`) require 4.3+, so
 
 **Empty-array expansion under `set -u` is the other 4.2 trap.** `"${arr[@]}"` on an EMPTY array aborts with "unbound variable" on bash 4.2/4.3 (fixed in 4.4 — so it is invisible on bash 5.x and only bites on the target 4.2.46). Use `"${arr[@]+"${arr[@]}"}"` for any array that may be empty, or guard with `[ "${#arr[@]}" -gt 0 ]` before the loop. This bit `selective_copy.sh` (an empty `EXCLUDE_MAPPING` and no-match `rsync_exclude_args`) and surfaced only once tested on real 4.2.46.
 
-`selective_copy.sh` is **config-driven**: nothing job-specific is hardcoded. `--config <file>` (a sourced bash snippet — see `selective_copy.conf.example`) supplies `SOURCE_BASE_DIR`, `TARGET_BASE_DIR`, an optional fixed `STAGING_DIR`, and the `COPY_MAPPING` / `SYMBOLIC_LINK_MAPPING` / `EXCLUDE_MAPPING` / `NESTED_ITEM_TRANSFORM` arrays; `--source-base` / `--target-base` / `--staging-dir` override the config. `prepare` honors a fixed `--staging-dir` (created + perms set, must be empty) or falls back to `mktemp`.
+`selective_copy.sh` is **config-driven and phased**: nothing job-specific is hardcoded. `--config <file>` (a sourced bash snippet — see `selective_copy.conf.example`) supplies `SOURCE_BASE_DIR`, `TARGET_BASE_DIR`, `STAGING_DIR`, `STATE_DIR`, `STAGING_BUDGET_BYTES`, and the `COPY_MAPPING` / `SYMBOLIC_LINK_MAPPING` / `EXCLUDE_MAPPING` / `NESTED_ITEM_TRANSFORM` arrays; `--source-base` / `--target-base` / `--staging-dir` / `--state-dir` / `--budget-bytes` override it. Because `/tmp` is capped (~1 GB) far below the data (~7 GB), the copy is **batched**: `plan` (once, source user) bin-packs files into `<=`budget batches and records every directory's mode+mtime; the two logins then **alternate with no inter-process synchronization** — `prepare` (source user) stages the next batch, `deploy` (target user) writes it, restores mode+mtime from a per-batch reference CSV (NOT ownership — the target stays target-owned), and drains `/tmp`; `finalize` (target user, once) creates symlinks, applies transforms, and reconciles directory mtimes deepest-first (a dir written across several batches has a bumped mtime until then). Coordination is **marker files** in `STATE_DIR` (`batch_NNN.{PLANNED,STAGED,DEPLOYED,*_FAILED}`): each user writes only its own markers and reads the others' — no locks, no cross-user file writes — so `prepare`/`deploy` are individually resumable (re-run resumes the current batch; a failure leaves a `*_FAILED` marker + reason). Staging is `0777` (NOT sticky `1777`) so the deploy user can drain the stage user's files. A free-space preflight (`check_free_space_bytes`) aborts a batch before rsync if it won't fit. Logging is dual: per-user human `<state>/<user>.log` + machine-readable `<state>/events.<user>.jsonl`; rsync runs `--info=progress2` for a live console %/rate.
 
 ## Shell hygiene patterns (don't drop these when editing)
 
