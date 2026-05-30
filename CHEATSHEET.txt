@@ -1,133 +1,172 @@
 FAT1 -> FAT2 MIGRATION CHEATSHEET
 ===================================
 
-MOCK REHEARSAL (safe — /tmp only)
----------------------------------
+THIS ENVIRONMENT (RHEL7-era host, bash 4.2.46, NO sudo; /tmp is the ONLY
+shared-writable location). Two unix accounts, each with read on both trees
+but write only on its own:
 
-# 1. Build mock from live tree
-bash bin/mock_build.sh \
-    --csv fat2.csv \
-    --source-root /applications/opc_d2 \
-    --mock-root /tmp/mock_f2 \
-    --reset
+  opc_d1  = SOURCE / FAT1 user  ->  /applications/opc_d1   (read-only from here on)
+  opc_d2  = TARGET / FAT2 user  ->  /applications/opc_d2   (this is what gets migrated)
+
+All scripts + their *.sh library modules are deployed together in ONE dir:
+  /tmp/test_f2/bin
+(They resolve each other via their own dir, so run them by full path from any
+cwd — e.g. `bash /tmp/test_f2/bin/migrator.sh ...`.)
+
+Set these once per shell (on BOTH the opc_d1 and opc_d2 side):
+
+  BIN=/tmp/test_f2/bin
+  SRC_ROOT=/applications/opc_d1            # FAT1 tree (selective_copy source)
+  TGT_ROOT=/applications/opc_d2            # FAT2 tree (migrated IN PLACE)
+  STAGING=/tmp/test_f2/migration           # cross-user copy handoff (opc_d1 -> opc_d2)
+  WORKDIR=/tmp/migration_f2                # migrator backups + tracking (opc_d2 side)
+  CSV=/tmp/test_f2/fat2.csv                # 3-col input for the rewrite step
+  CONF=/tmp/test_f2/selective_copy.conf    # job config for selective_copy
+
+Pipeline:  (0) selective_copy fat1 -> fat2   ->   (1) migrator rewrites residual
+fat1 references IN PLACE on /applications/opc_d2   ->   (2) validate.
+
+
+PHASE 0 — SELECTIVE COPY  (cross-user; SKIP if /applications/opc_d2 already populated)
+-------------------------------------------------------------------------------------
+# One-time: create the job config for this host (nothing is hardcoded in the
+# script — base dirs, items, and staging all come from --config)
+cp $BIN/selective_copy.conf.example $CONF
+$EDITOR $CONF
+#   SOURCE_BASE_DIR="/applications/opc_d1"
+#   TARGET_BASE_DIR="/applications/opc_d2"
+#   STAGING_DIR="/tmp/test_f2/migration"
+#   COPY_MAPPING=( "item|item/" ... )    <-- the items to copy (YOUR input)
+
+# As opc_d1 (SOURCE): stage fat1 items into /tmp
+bash $BIN/selective_copy.sh --mode prepare --config $CONF \
+    --source-user opc_d1 --target-user opc_d2
+
+# As opc_d2 (TARGET): deploy from /tmp into /applications/opc_d2
+bash $BIN/selective_copy.sh --mode deploy --config $CONF \
+    --target-user opc_d2 --staging-dir $STAGING
+
+# Cleanup the staging dir once both sides are done
+bash $BIN/selective_copy.sh --mode cleanup --staging-dir $STAGING
+# (refuses to run as root; --source-base/--target-base/--staging-dir override the config)
+
+
+MOCK REHEARSAL  (as opc_d2; safe — /tmp only, never touches /applications/opc_d2)
+--------------------------------------------------------------------------------
+# 1. Build a mock of the live fat2 tree from the CSV
+bash $BIN/mock_build.sh --csv $CSV --source-root $TGT_ROOT \
+    --mock-root /tmp/mock_f2 --reset
 # Check: failed=0
 
-# 2. Execute on mock
-bash bin/migrator.sh \
-    --mode execute \
-    --root /tmp/mock_f2 \
-    --csv /tmp/mock_f2/mock_input.csv \
-    --workdir /tmp/migration_f2_mock
+# 2. Execute on the mock
+bash $BIN/migrator.sh --mode execute --root /tmp/mock_f2 \
+    --csv /tmp/mock_f2/mock_input.csv --workdir /tmp/migration_f2_mock
 # Check: all COMPLETED, no FAILED
 
 # 3. Validate
-bash bin/validate.sh \
-    --root /tmp/mock_f2 \
-    --workdir /tmp/migration_f2_mock \
-    --verbose
+bash $BIN/validate.sh --root /tmp/mock_f2 --workdir /tmp/migration_f2_mock \
+    --scan-root /tmp/mock_f2 --verbose
 # Check: VALIDATE PASSED
 
 # 4. Rollback + validate
-bash bin/migrator.sh \
-    --mode rollback \
-    --root /tmp/mock_f2 \
-    --workdir /tmp/migration_f2_mock \
-    --validate
+bash $BIN/migrator.sh --mode rollback --root /tmp/mock_f2 \
+    --workdir /tmp/migration_f2_mock --validate
 # Check: Rollback validation passed
 
 # 5. Cleanup mock
-bash bin/migrator.sh \
-    --mode cleanup \
-    --root /tmp/mock_f2 \
+bash $BIN/migrator.sh --mode cleanup --root /tmp/mock_f2 \
     --workdir /tmp/migration_f2_mock
 rm -rf /tmp/mock_f2 /tmp/migration_f2_mock
 
+# One-shot equivalent of steps 1-4 (prepare->execute->validate->rollback->verify):
+NONINTERACTIVE=1 bash $BIN/setup_migrator_test.sh --mode all \
+    --csv $CSV --source-root $TGT_ROOT
 
-LIVE MIGRATION
---------------
-!! Complete in ONE session. Reboot = backups gone = no rollback !!
 
-# 1. Execute
-bash bin/migrator.sh \
-    --mode execute \
-    --root /applications/opc_d2 \
-    --csv fat2.csv \
-    --workdir /tmp/migration_f2 \
-    --yes
-# 5s countdown. Ctrl-C to abort.
+LIVE MIGRATION  (as opc_d2)
+---------------------------
+!! Complete in ONE session. Reboot or /tmp sweep = backups gone = no rollback !!
+
+# 1. Execute (rewrites fat1 refs IN PLACE on /applications/opc_d2)
+bash $BIN/migrator.sh --mode execute --root $TGT_ROOT \
+    --csv $CSV --workdir $WORKDIR --yes
+# --yes required for non-/tmp root; 5s countdown follows, Ctrl-C to abort.
 
 # 2. Validate
-bash bin/validate.sh \
-    --root /applications/opc_d2 \
-    --workdir /tmp/migration_f2 \
-    --verbose
+bash $BIN/validate.sh --root $TGT_ROOT --workdir $WORKDIR \
+    --scan-root $TGT_ROOT --verbose
+# Check: VALIDATE PASSED. --scan-root reports any residual fat1 references.
 
-# 2a. (Optional) Fix directory mtimes — migrator preserves FILE mtimes
-#     but renames bump every parent dir's mtime to "now".
-bash bin/fix_dir_mtimes.sh \
-    --root /applications/opc_d2 \
-    --cutoff "<just before migration>" \
-    --dry-run --verbose
-# Inspect dry-run; if correct, rerun without --dry-run.
+# 2a. (Optional) repair directory mtimes bumped by the renames
+bash $BIN/fix_dir_mtimes.sh --root $TGT_ROOT \
+    --cutoff "<timestamp just before execute ran>" --dry-run --verbose
+# inspect dry-run; rerun without --dry-run if correct
 
 # 3. Decision:
-#    GOOD  -> cleanup (permanent, no rollback after this)
-#    BAD   -> rollback
-
-# 3a. Cleanup (point of no return)
-bash bin/migrator.sh \
-    --mode cleanup \
-    --root /applications/opc_d2 \
-    --workdir /tmp/migration_f2
-
-# 3b. Rollback
-bash bin/migrator.sh \
-    --mode rollback \
-    --root /applications/opc_d2 \
-    --workdir /tmp/migration_f2 \
-    --yes \
-    --validate
+#    GOOD -> cleanup (POINT OF NO RETURN — deletes backups, rollback impossible)
+bash $BIN/migrator.sh --mode cleanup --root $TGT_ROOT --workdir $WORKDIR
+#    BAD  -> rollback
+bash $BIN/migrator.sh --mode rollback --root $TGT_ROOT --workdir $WORKDIR \
+    --yes --validate
 
 
 IF KILLED
 ---------
-Re-run the same command. It resumes automatically.
-
-  execute killed  -> re-run execute (same args)
-  rollback killed -> re-run rollback (same args)
+Re-run the exact same command (same --root, --csv, --workdir). It resumes:
+  execute killed  -> re-run execute   (COMPLETED skipped; BACKED_UP restored+redone)
+  rollback killed -> re-run rollback  (ROLLED_BACK skipped; rest restored)
 
 
 IF VALIDATE FAILS
 -----------------
-DO NOT cleanup. Rollback first, investigate, retry.
-
-bash bin/migrator.sh \
-    --mode rollback \
-    --root /applications/opc_d2 \
-    --workdir /tmp/migration_f2 \
+DO NOT cleanup. Rollback first, then investigate and retry:
+bash $BIN/migrator.sh --mode rollback --root $TGT_ROOT --workdir $WORKDIR \
     --yes --validate
 
 
 IF /tmp WIPED
 -------------
-Backups gone. Cannot rollback.
-Re-run selective_copy.sh from fat1 user to restore.
+Backups gone -> cannot rollback. Re-run PHASE 0 (selective_copy prepare as
+opc_d1, deploy as opc_d2) to restore /applications/opc_d2 from fat1, then
+re-run the migration.
 
 
-FIX DIR MTIMES (optional, post-migration)
------------------------------------------
-Renames bump parent dirs to "now". File mtimes are already preserved by
-migrator. To make dirs look untouched too:
+BEHAVIORS THE SCRIPTS NOW HANDLE
+--------------------------------
+- Blank / whitespace-only CSV lines and paths containing spaces: tolerated
+  (a stray blank line no longer aborts the whole run).
+- fat1_X and fat2_X coexisting: fat2_X is rewritten in place, fat1_X is LEFT
+  alone; rollback restores fat2_X and PRESERVES the pre-existing fat1_X.
+- A renamed directory's fat1-named children are renamed + content-rewritten
+  too (deepest-first), so a listed descendant of a renamed dir is migrated.
+- Symlinks (including dangling): target remapped, link renamed, mtime kept.
+- Binary files listed in the CSV (e.g. *.jks keystores): RENAMED, and their
+  content is ALSO run through the token rewrite. Review keystores/binaries if
+  byte-exact content matters — handle those outside the CSV if needed.
 
-bash bin/fix_dir_mtimes.sh \
-    --root /applications/opc_d2 \
-    --cutoff "2026-05-25 18:00:00" \
-    --dry-run --verbose
-# then drop --dry-run
 
-- Cutoff = timestamp just before migrator ran (any `date -d` string).
-- Only touches dirs with mtime > cutoff. Never bumps forward, only back.
-- Deepest-first: children fixed before parents, fix propagates upward.
-- Run BEFORE rollback if you want consistent dir mtimes; rollback also
-  renames and will re-bump dirs.
-- No undo. Dry-run first.
+VERIFY THE TOOLKIT  (off-host, from the repo checkout — bash 4.2.46 in a container)
+----------------------------------------------------------------------------------
+# A dev box (macOS/BSD, bash 5.x) CANNOT run these scripts. Verify in centos:7,
+# run from the repo root:
+docker run --rm -v "$PWD":/work -w /work centos:7 bash bin/run_all_tests.sh
+docker run --rm -v "$PWD":/work -w /work centos:7 bash tests/run_mock_env_test.sh
+docker run --rm -v "$PWD":/work -w /work centos:7 bash tests/edge_cases.sh
+# selective_copy's test needs rsync (absent from base centos:7) -> bashutils7:rsync
+docker run --rm -v "$PWD":/work -w /work bashutils7:rsync bash tests/selective_copy_test.sh
+
+
+QUICK REFERENCE
+---------------
+selective_copy.sh  --mode prepare|deploy|cleanup  --config <file>
+                   --source-user opc_d1  --target-user opc_d2  --staging-dir <path>
+                   [--source-base <path>] [--target-base <path>] [--shared-group G]
+mock_build.sh      --csv <csv>  --source-root <path>  [--mock-root <path>] [--reset]
+migrator.sh        --mode execute|rollback|cleanup|validate  --root <path>
+                   --csv <csv> (execute)  --workdir <path>
+                   --yes (non-/tmp root)  --validate (rollback)  [--dry-run]
+validate.sh        --root <path>  --workdir <path>  [--scan-root <path>] [--verbose]
+fix_dir_mtimes.sh  --root <path>  --cutoff "<date>"  [--dry-run] [--verbose]
+
+Internal library modules (sourced by the tools, never run directly):
+  common.sh  migration_map.sh  tracking.sh  backup.sh
