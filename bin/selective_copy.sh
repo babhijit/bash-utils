@@ -57,39 +57,49 @@ require_bash_version 4 2
 set -euo pipefail
 
 # =============================================================================
-#                              CONFIGURATION (edit for your job)
+#                              JOB CONFIGURATION
 # =============================================================================
+#
+# NOTHING job-specific is hardcoded here. Everything below is supplied at
+# runtime via:
+#   --config <file>   a sourced bash snippet (see selective_copy.conf.example)
+#   --source-base / --target-base / --staging-dir   CLI overrides (win over config)
+#
+# Defaults are empty so `set -u` array expansions stay safe; the required
+# values are asserted per-mode (run_prepare / run_deploy) with clear messages.
+#
+# Config file contract (all optional except the base dir the mode needs):
+#   SOURCE_BASE_DIR="/applications/opc_d1"
+#   TARGET_BASE_DIR="/applications/opc_d2"
+#   STAGING_DIR="/tmp/test_f2/migration"            # optional; else a mktemp dir
+#   COPY_MAPPING=( "src_name|dest_name" ... )
+#   SYMBOLIC_LINK_MAPPING=( "src_link|dest_link|dest_target" ... )
+#   EXCLUDE_MAPPING=( "src_name:relative_pattern" ... )
+#   NESTED_ITEM_TRANSFORM=( "rel_path|new_name|new_link_target" ... )
+#
+# Security: --config is sourced as bash. Use only operator-authored configs
+# (same trust level as the script itself).
 
-# Base paths can be overridden via --source-base / --target-base.
-SOURCE_BASE_DIR="/home/xbapp_d1"
-TARGET_BASE_DIR="/home/xbapp_d2"
+SOURCE_BASE_DIR=""
+TARGET_BASE_DIR=""
 
-# Items to copy from source to target. Format: "src_name|dest_name"
-readonly COPY_MAPPING=(
-    "bulk-helm-opc|bulk-helm-opc/"
-    "oradiag_xbapp_d1|oradiag_xbapp_d2/"
-)
-
-# Symbolic links to create at destination. Format: "src_link|dest_link|dest_target"
-readonly SYMBOLIC_LINK_MAPPING=()
-
-# rsync exclusions per source. Format: "src_name:relative_pattern"
-readonly EXCLUDE_MAPPING=()
-
-# Nested transformations applied AFTER copy. Format: "rel_path|new_name|new_link_target"
-readonly NESTED_ITEM_TRANSFORM=(
-    "oradiag_xbapp_d2/diag/clients/user_xbapp_d1|user_xbapp_d2|"
-)
+# Populated by --config. Declared empty (not readonly) so the config may set
+# them; locked readonly in parse_args once config + CLI have been applied.
+COPY_MAPPING=()
+SYMBOLIC_LINK_MAPPING=()
+EXCLUDE_MAPPING=()
+NESTED_ITEM_TRANSFORM=()
 
 # =============================================================================
 #                              GLOBAL STATE (CLI)
 # =============================================================================
 
 MODE=""
-STAGING_DIR=""           # if empty for --mode prepare, mktemp -d picks one
+CONFIG_FILE=""           # --config: sourced bash snippet with the job config
+STAGING_DIR=""           # --staging-dir or config STAGING_DIR; else mktemp (prepare)
 SOURCE_USER=""
 TARGET_USER=""
-SHARED_GROUP=""          # if set, staging chmod is 770 + chgrp instead of 777
+SHARED_GROUP=""          # if set, staging chmod is 2770 + chgrp instead of 777
 FORCE_CLEANUP=0
 
 # =============================================================================
@@ -98,55 +108,67 @@ FORCE_CLEANUP=0
 
 usage() {
     cat >&2 <<EOF
-Usage: $0 --mode <prepare|deploy|cleanup> [options]
+Usage: $0 --mode <prepare|deploy|cleanup> --config <file> [options]
+
+Job specifics (base dirs, item lists, optional staging path) come from
+--config (a sourced bash snippet) and/or the override flags below. Nothing is
+hardcoded in the script. See selective_copy.conf.example for the contract.
 
 REQUIRED for prepare:
   --mode prepare
+  --config FILE         Job config defining SOURCE_BASE_DIR, TARGET_BASE_DIR,
+                        COPY_MAPPING, etc. (or supply base dirs via flags below)
   --source-user USER    Expected uid name on this side (sanity check)
   --target-user USER    Expected uid name for the deploy step (recorded)
 
 REQUIRED for deploy:
   --mode deploy
-  --staging-dir PATH    Path printed at end of prepare
+  --config FILE         The SAME config used for prepare (TARGET_BASE_DIR + the
+                        item lists deploy must replay)
+  --staging-dir PATH    Staging dir from prepare (or set STAGING_DIR in config)
   --target-user USER    Expected uid name on this side (sanity check)
 
 REQUIRED for cleanup:
   --mode cleanup
   --staging-dir PATH
 
-OPTIONAL:
-  --source-base PATH    Override SOURCE_BASE_DIR (default: $SOURCE_BASE_DIR)
-  --target-base PATH    Override TARGET_BASE_DIR (default: $TARGET_BASE_DIR)
-  --shared-group GROUP  Use mode 770 + chgrp instead of 777 (both users must
+OPTIONAL (override the config):
+  --source-base PATH    SOURCE_BASE_DIR (no hardcoded default)
+  --target-base PATH    TARGET_BASE_DIR (no hardcoded default)
+  --staging-dir PATH    Fixed staging dir. For prepare it is created + perms set
+                        (must be empty or absent); if unset, prepare uses mktemp.
+  --shared-group GROUP  Use mode 2770 + chgrp instead of 777 (both users must
                         already belong to this group; no sudo to fix that here)
   --force               cleanup proceeds even if not owned by current user
   --log-file PATH       Default: <staging-dir>/selective_copy.log
 
 EXAMPLES:
-  # As source user (e.g. xbapp_d1)
-  $0 --mode prepare --source-user xbapp_d1 --target-user xbapp_d2
-  # ... script prints staging dir, e.g. /tmp/scopy.XXXXXX
+  # As source user (e.g. opc_d1) — staging path taken from the config:
+  $0 --mode prepare --config ./selective_copy.conf --source-user opc_d1 --target-user opc_d2
 
-  # As target user (e.g. xbapp_d2)
-  $0 --mode deploy --target-user xbapp_d2 --staging-dir /tmp/scopy.XXXXXX
+  # As target user (e.g. opc_d2):
+  $0 --mode deploy  --config ./selective_copy.conf --target-user opc_d2 --staging-dir /tmp/test_f2/migration
 
-  # As either user once deploy verifies
-  $0 --mode cleanup --staging-dir /tmp/scopy.XXXXXX
+  # Cleanup (either user who owns the staging dir):
+  $0 --mode cleanup --staging-dir /tmp/test_f2/migration
 EOF
     exit 1
 }
 
 parse_args() {
-    local log_arg=""
+    # CLI base/staging are captured into temporaries so they can be applied
+    # AFTER the config file is sourced — CLI flags must win over config.
+    local log_arg="" cli_source_base="" cli_target_base="" cli_staging=""
     if [ "$#" -eq 0 ]; then usage; fi
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --mode)         MODE="$2"; shift 2 ;;
-            --staging-dir)  STAGING_DIR="$2"; shift 2 ;;
+            --config)       CONFIG_FILE="$2"; shift 2 ;;
+            --staging-dir)  cli_staging="$2"; shift 2 ;;
             --source-user)  SOURCE_USER="$2"; shift 2 ;;
             --target-user)  TARGET_USER="$2"; shift 2 ;;
-            --source-base)  SOURCE_BASE_DIR="$2"; shift 2 ;;
-            --target-base)  TARGET_BASE_DIR="$2"; shift 2 ;;
+            --source-base)  cli_source_base="$2"; shift 2 ;;
+            --target-base)  cli_target_base="$2"; shift 2 ;;
             --shared-group) SHARED_GROUP="$2"; shift 2 ;;
             --force)        FORCE_CLEANUP=1; shift ;;
             --log-file)     log_arg="$2"; shift 2 ;;
@@ -157,7 +179,30 @@ parse_args() {
 
     [ -n "$MODE" ] || usage
 
-    # LOG_FILE depends on whether we have STAGING_DIR yet. Default deferred.
+    # Load the job config FIRST (it may set base dirs, STAGING_DIR, and the
+    # item arrays), so the CLI overrides applied next take precedence.
+    if [ -n "$CONFIG_FILE" ]; then
+        [ -f "$CONFIG_FILE" ] || die "Config file not found: $CONFIG_FILE"
+        # shellcheck disable=SC1090  # operator-authored config, sourced as bash
+        source "$CONFIG_FILE"
+    fi
+
+    # CLI overrides win over config.
+    [ -n "$cli_source_base" ] && SOURCE_BASE_DIR="$cli_source_base"
+    [ -n "$cli_target_base" ] && TARGET_BASE_DIR="$cli_target_base"
+    [ -n "$cli_staging" ]     && STAGING_DIR="$cli_staging"
+
+    # Normalize the paths we have (collapse //, drop trailing /) so later
+    # prefix/concatenation logic is clean.
+    [ -n "$SOURCE_BASE_DIR" ] && SOURCE_BASE_DIR="$(normalize_path "$SOURCE_BASE_DIR")"
+    [ -n "$TARGET_BASE_DIR" ] && TARGET_BASE_DIR="$(normalize_path "$TARGET_BASE_DIR")"
+    [ -n "$STAGING_DIR" ]     && STAGING_DIR="$(normalize_path "$STAGING_DIR")"
+
+    # Lock the job inputs now that config + CLI are resolved. (STAGING_DIR is
+    # NOT locked — create_staging_dir assigns it in the mktemp case.)
+    readonly SOURCE_BASE_DIR TARGET_BASE_DIR \
+             COPY_MAPPING SYMBOLIC_LINK_MAPPING EXCLUDE_MAPPING NESTED_ITEM_TRANSFORM
+
     if [ -n "$log_arg" ]; then
         export LOG_FILE="$log_arg"
     fi
@@ -186,9 +231,18 @@ assert_running_as() {
 # =============================================================================
 
 create_staging_dir() {
-    # Always under /tmp (or operator-supplied --staging-dir base).
-    local parent="/tmp"
-    STAGING_DIR="$(mktemp -d "${parent}/scopy.XXXXXXXX")"
+    if [ -n "$STAGING_DIR" ]; then
+        # Operator-supplied fixed staging path (from --staging-dir or config).
+        # Refuse to clobber an existing non-empty dir — a clean prepare and the
+        # deploy-side tamper check both assume staging starts empty.
+        if [ -e "$STAGING_DIR" ] && [ -n "$(ls -A "$STAGING_DIR" 2>/dev/null)" ]; then
+            die "Staging dir '$STAGING_DIR' already exists and is non-empty. Remove it or choose another."
+        fi
+        safe_mkdir_p "$STAGING_DIR"
+    else
+        # No fixed path given — generate a fresh one under /tmp.
+        STAGING_DIR="$(mktemp -d "/tmp/scopy.XXXXXXXX")"
+    fi
 
     if [ -n "$SHARED_GROUP" ]; then
         if ! chgrp "$SHARED_GROUP" "$STAGING_DIR" 2>/dev/null; then
@@ -214,6 +268,12 @@ state_file_path() {
 run_prepare() {
     [ -n "$SOURCE_USER" ] || die "--mode prepare requires --source-user"
     [ -n "$TARGET_USER" ] || die "--mode prepare requires --target-user"
+    [ -n "$SOURCE_BASE_DIR" ] || die "--mode prepare requires SOURCE_BASE_DIR (set it in --config or pass --source-base)"
+    [ -n "$TARGET_BASE_DIR" ] || die "--mode prepare requires TARGET_BASE_DIR (recorded for deploy; set it in --config or pass --target-base)"
+    [ -d "$SOURCE_BASE_DIR" ] || die "Source base dir does not exist: $SOURCE_BASE_DIR"
+    if [ "${#COPY_MAPPING[@]}" -eq 0 ] && [ "${#SYMBOLIC_LINK_MAPPING[@]}" -eq 0 ]; then
+        warn "No COPY_MAPPING or SYMBOLIC_LINK_MAPPING items configured — nothing to stage."
+    fi
     assert_running_as "$SOURCE_USER" "prepare"
 
     create_staging_dir
@@ -229,23 +289,42 @@ run_prepare() {
         info "Staging regular items..."
         for item_map in "${COPY_MAPPING[@]}"; do
             IFS='|' read -r src_name dest_name <<< "${item_map}"
+            src_name="${src_name%/}"; dest_name="${dest_name%/}"   # normalize trailing /
             full_src_path="${SOURCE_BASE_DIR}/${src_name}"
             stage_dest_path="${STAGING_DIR}/${dest_name}"
-            if [ ! -e "$full_src_path" ]; then
+            if [ ! -e "$full_src_path" ] && [ ! -L "$full_src_path" ]; then
                 warn "Source missing, skipping: $full_src_path"
                 continue
             fi
             local rsync_exclude_args=()
             local rule rule_src_name rule_pattern
-            for rule in "${EXCLUDE_MAPPING[@]}"; do
+            # bash 4.2/4.3 quirk: "${arr[@]}" on an EMPTY array under `set -u`
+            # is an "unbound variable" error (fixed in 4.4 — which is why bash
+            # 5.x never caught this). Use the "${arr[@]+"${arr[@]}"}" form so an
+            # empty EXCLUDE_MAPPING expands to nothing instead of aborting on
+            # the target bash 4.2.46.
+            for rule in "${EXCLUDE_MAPPING[@]+"${EXCLUDE_MAPPING[@]}"}"; do
                 IFS=':' read -r rule_src_name rule_pattern <<< "$rule"
                 if [ "$rule_src_name" = "$src_name" ]; then
                     rsync_exclude_args+=(--exclude="$rule_pattern")
                 fi
             done
             info "Staging: $full_src_path -> $stage_dest_path"
-            if ! rsync -a "${rsync_exclude_args[@]}" "$full_src_path" "$stage_dest_path"; then
-                die "rsync failed: $full_src_path -> $stage_dest_path"
+            safe_mkdir_p "$(dirname "$stage_dest_path")"
+            # Copy so the item lands AT dest_name (rename-capable), NOT nested
+            # inside it. For a directory, trailing slashes on BOTH sides copy the
+            # CONTENTS into dest (so /src/bin -> STAGING/<dest>, not
+            # STAGING/<dest>/bin). For a file/symlink, copy to the dest path.
+            # (rsync_exclude_args guarded for the same bash-4.2 empty-array reason.)
+            if [ -d "$full_src_path" ] && [ ! -L "$full_src_path" ]; then
+                safe_mkdir_p "$stage_dest_path"
+                if ! rsync -a "${rsync_exclude_args[@]+"${rsync_exclude_args[@]}"}" "$full_src_path/" "$stage_dest_path/"; then
+                    die "rsync failed: $full_src_path -> $stage_dest_path"
+                fi
+            else
+                if ! rsync -a "${rsync_exclude_args[@]+"${rsync_exclude_args[@]}"}" "$full_src_path" "$stage_dest_path"; then
+                    die "rsync failed: $full_src_path -> $stage_dest_path"
+                fi
             fi
         done
     fi
@@ -302,6 +381,7 @@ run_prepare() {
 run_deploy() {
     [ -n "$STAGING_DIR" ] || die "--mode deploy requires --staging-dir"
     [ -n "$TARGET_USER" ] || die "--mode deploy requires --target-user"
+    [ -n "$TARGET_BASE_DIR" ] || die "--mode deploy requires TARGET_BASE_DIR (set it in --config or pass --target-base)"
     [ -d "$STAGING_DIR" ] || die "Staging dir not found: $STAGING_DIR"
 
     assert_running_as "$TARGET_USER" "deploy"
@@ -341,16 +421,19 @@ run_deploy() {
         info "Deploying regular items..."
         for item_map in "${COPY_MAPPING[@]}"; do
             IFS='|' read -r src_name dest_name <<< "$item_map"
+            dest_name="${dest_name%/}"   # normalize, matching prepare
             stage_src_path="${STAGING_DIR}/${dest_name}"
             final_dest_path="${TARGET_BASE_DIR}/${dest_name}"
-            if [ ! -e "$stage_src_path" ]; then
+            if [ ! -e "$stage_src_path" ] && [ ! -L "$stage_src_path" ]; then
                 warn "Staged item missing: $stage_src_path"
                 continue
             fi
             if [ -d "$stage_src_path" ] && [ ! -L "$stage_src_path" ]; then
                 safe_mkdir_p "$final_dest_path"
-                info "Deploying dir: $stage_src_path/ -> $final_dest_path"
-                rsync -a "$stage_src_path/" "$final_dest_path" || die "rsync failed for $stage_src_path"
+                info "Deploying dir: $stage_src_path/ -> $final_dest_path/"
+                # Trailing slash on src + dest dir => contents land directly
+                # under final_dest_path (no nesting), mirroring prepare.
+                rsync -a "$stage_src_path/" "$final_dest_path/" || die "rsync failed for $stage_src_path"
             else
                 safe_mkdir_p "$(dirname "$final_dest_path")"
                 info "Deploying: $stage_src_path -> $final_dest_path"

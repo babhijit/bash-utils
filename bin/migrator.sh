@@ -45,6 +45,12 @@
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=common.sh
 source "${SCRIPT_DIR}/common.sh"
+# shellcheck source=migration_map.sh
+source "${SCRIPT_DIR}/migration_map.sh"   # MIGRATION_MAP (passive data module)
+# shellcheck source=tracking.sh
+source "${SCRIPT_DIR}/tracking.sh"         # tracking-file contract + reader
+# shellcheck source=backup.sh
+source "${SCRIPT_DIR}/backup.sh"           # backup_path_for() + backup_cp()
 require_bash_version 4 2
 set -euo pipefail
 
@@ -52,24 +58,13 @@ set -euo pipefail
 #                                 CONFIGURATION
 # =============================================================================
 #
-# Forward mapping ONLY. The reverse mapping is derived at runtime via
-# derive_reverse_map() — change keys here, the reverse stays in sync.
+# MIGRATION_MAP now lives in migration_map.sh (sourced above) — a passive data
+# module shared by migrator, finder, and validate, so none of them sources
+# another tool. Both path and content rewrites use that one map.
 #
-# Both path and content rewrites use the same map. If a future job needs
-# separate maps for paths vs contents, split this into two declarations.
-
-declare -Ar MIGRATION_MAP=(
-    ["FAT1"]="FAT2"
-    ["fat1"]="fat2"
-    ["opc_d1"]="opc_d2"
-    ["xbapp_d1"]="xbapp_d2"
-    ["opcsvcf1"]="opcsvcf2"
-)
-
-# Derived at runtime. Kept as a regular declare (not readonly) because
-# derive_reverse_map populates it post-declaration.
-declare -A REVERSE_MIGRATION_MAP=()
-derive_reverse_map MIGRATION_MAP REVERSE_MIGRATION_MAP
+# There is no REVERSE_MIGRATION_MAP: the old derived-reverse array was never
+# consumed anywhere, so it was dropped per YAGNI. If a reverse (fat2 -> fat1)
+# migration is ever needed, derive it at the point of use.
 
 # =============================================================================
 #                                 GLOBAL STATE
@@ -145,69 +140,24 @@ EOF
 #                            BACKUP PATH MAPPING
 # =============================================================================
 #
-# Backup tree mirrors the original tree shape so collisions are impossible.
-# Example:  /applications/opc_d2/conf/x.xml
-#       ->  <backup_dir>/applications/opc_d2/conf/x.xml
-#
-# This means rollback can use the same structural mapping to find each
-# row's backup without consulting the tracking file beyond row-existence.
-
-backup_path_for() {
-    local original="$1"
-    printf '%s%s' "$BACKUP_DIR" "$original"
-}
+# backup_path_for() and the backup_cp() primitive now live in backup.sh
+# (sourced above). The backup tree mirrors the original tree shape — e.g.
+# /applications/opc_d2/conf/x.xml -> <backup_dir>/applications/opc_d2/conf/x.xml
+# — so collisions are impossible and rollback is structural. That layout is a
+# contract shared with validate.sh, hence a module both depend on rather than a
+# function buried in this tool.
 
 # =============================================================================
 #                            TRACKING FILE FORMAT
 # =============================================================================
 #
-# Append-only CSV. Columns:
+# The tracking-file contract — header/append writers, the latest-status and
+# field readers, and tracking_load_latest() — now lives in tracking.sh
+# (sourced above). The format is unchanged: an append-only CSV
 #   Original_Path,New_Path,Backup_Path,Original_Timestamp,Status
-#
-# Status is one of: BACKED_UP, COMPLETED, ROLLED_BACK.
-#
-# The latest status for a given Original_Path wins. We never rewrite the
-# file in place (avoids the O(n²) cost of the previous design).
-
-tracking_header() {
-    echo "Original_Path,New_Path,Backup_Path,Original_Timestamp,Status"
-}
-
-tracking_append() {
-    local orig="$1" newp="$2" bkp="$3" ts="$4" status="$5"
-    printf '"%s","%s","%s","%s","%s"\n' \
-        "$orig" "$newp" "$bkp" "$ts" "$status" >> "$TRACKING_FILE"
-}
-
-# tracking_latest_status_for <path>
-# Echoes the latest status for <path>, or empty string if never recorded.
-tracking_latest_status_for() {
-    local target="$1"
-    [ -f "$TRACKING_FILE" ] || { echo ""; return; }
-    # Reverse-walk to find the most recent entry first. tac is widely
-    # available on Linux; we don't need the macOS shim here.
-    local status
-    status=$(tac "$TRACKING_FILE" 2>/dev/null \
-        | awk -F'","' -v target="\"$target" '
-            $1 == target { gsub(/"$/, "", $5); print $5; exit }
-        ') || true
-    echo "$status"
-}
-
-# tracking_field_for <path> <field_number>
-# Returns field N (1-based) from the latest tracking entry for <path>.
-# Fields: 1=Original_Path 2=New_Path 3=Backup_Path 4=Timestamp 5=Status
-tracking_field_for() {
-    local target="$1"
-    local fieldnum="$2"
-    [ -f "$TRACKING_FILE" ] || { echo ""; return; }
-    local val
-    val=$(tac "$TRACKING_FILE" 2>/dev/null \
-        | awk -F'","' -v target="\"$target" -v fn="$fieldnum" '
-            $1 == target { gsub(/(^"|"$)/, "", $fn); print $fn; exit }
-        ') || true
-    echo "$val"
-}
+# with Status in {BACKED_UP, COMPLETED, ROLLED_BACK}; the latest row for a
+# given Original_Path wins, and the file is never rewritten in place. The
+# writer helpers read this tool's $TRACKING_FILE global.
 
 # =============================================================================
 #                              ARGUMENT PARSING
@@ -397,11 +347,10 @@ process_row() {
     # The FIRST backup captures the original state; overwriting it with a
     # second cp -a after content has already been rewritten would lose the
     # original.
-    safe_mkdir_p "$(dirname "$bkp")"
     if [ -e "$bkp" ] || [ -L "$bkp" ]; then
         info "BACKUP EXISTS (preserving original): $bkp"
     else
-        if ! cp -a "$effective_src" "$bkp"; then
+        if ! backup_cp "$effective_src" "$bkp"; then
             die "BACKUP failed for '$effective_src' -> '$bkp'. Halting before any mutation."
         fi
     fi
@@ -453,22 +402,50 @@ migrate_directory() {
     if [ "$orig_path" != "$new_path" ]; then
         mv "$orig_path" "$new_path"
     fi
-    # Rewrite contents of every regular file inside, depth-first. Each
-    # rewrite bumps the child's mtime via replace_content_in_file's
-    # truncate-rewrite — we capture the child mtime first and restore
-    # it after. Without this, children inside a renamed directory would
-    # drift away from their fat1 originals.
-    local file_in_dir child_mtime
-    while IFS= read -r -d '' file_in_dir; do
-        child_mtime=$(lstat_mtime_human "$file_in_dir")
-        if ! replace_content_in_file "$file_in_dir" MIGRATION_MAP; then
-            warn "Content replace failed inside directory: $file_in_dir"
-            continue
+
+    # Walk the (renamed) directory and, for every entry inside it:
+    #   1. (regular files) rewrite content, preserving the child's mtime —
+    #      each rewrite bumps mtime via replace_content_in_file's
+    #      truncate-rewrite, so we capture it first and restore it after.
+    #   2. (any entry whose BASENAME carries a migration token) rename the
+    #      basename. This is load-bearing for descendants that are ALSO their
+    #      own CSV rows: once this directory is renamed, such a child's CSV
+    #      path is stale and its row is skipped, so the directory migration is
+    #      the only place its NAME can be migrated. Without this, a renamed
+    #      directory would keep fat1-named children. (Bug C.)
+    #
+    # Entries are collected up front (NUL-delimited) and processed
+    # DEEPEST-FIRST: renaming a child must not invalidate the path of a
+    # not-yet-processed deeper entry, and `find -depth` yields contents before
+    # their containing directory. mv preserves mtime, so renamed entries need
+    # no mtime restore.
+    local entries=()
+    local entry
+    while IFS= read -r -d '' entry; do
+        entries+=("$entry")
+    done < <(find "$new_path" -depth -mindepth 1 -print0)
+
+    local base mapped target child_mtime
+    for entry in "${entries[@]}"; do
+        if [ -f "$entry" ] && [ ! -L "$entry" ]; then
+            child_mtime=$(lstat_mtime_human "$entry")
+            if ! replace_content_in_file "$entry" MIGRATION_MAP; then
+                warn "Content replace failed inside directory: $entry"
+            elif ! restore_mtime_from_human "$entry" "$child_mtime" 2>/dev/null; then
+                warn "Child mtime restore failed: $entry"
+            fi
         fi
-        if ! restore_mtime_from_human "$file_in_dir" "$child_mtime" 2>/dev/null; then
-            warn "Child mtime restore failed: $file_in_dir"
+        base="$(basename "$entry")"
+        mapped="$(apply_path_mapping "$base" MIGRATION_MAP)"
+        if [ "$mapped" != "$base" ]; then
+            target="$(dirname "$entry")/$mapped"
+            if [ -e "$target" ] || [ -L "$target" ]; then
+                warn "Inner-rename target already exists, leaving as-is: $target"
+            elif ! mv "$entry" "$target"; then
+                warn "Inner-rename failed: $entry -> $target"
+            fi
         fi
-    done < <(find "$new_path" -type f -print0)
+    done
 }
 
 migrate_file() {
@@ -532,9 +509,9 @@ restore_from_backup() {
         return 1
     fi
 
-    # If the new (post-migration) path exists, remove it first. We don't
-    # know whether the original path or the new path is currently live, so
-    # remove both possibilities.
+    # Clear the locations we are about to overwrite, then restore. Remove the
+    # post-migration path (new_path) and the restore target (restore_to) if
+    # they are currently live.
     local new_path
     new_path="$(apply_path_mapping "$orig_path" MIGRATION_MAP)"
     if [ "$new_path" != "$orig_path" ] && { [ -e "$new_path" ] || [ -L "$new_path" ]; }; then
@@ -543,13 +520,14 @@ restore_from_backup() {
     if [ "$restore_to" != "$new_path" ] && { [ -e "$restore_to" ] || [ -L "$restore_to" ]; }; then
         rm -rf "$restore_to"
     fi
-    if [ "$orig_path" != "$new_path" ] && [ "$orig_path" != "$restore_to" ] && \
-       { [ -e "$orig_path" ] || [ -L "$orig_path" ]; }; then
-        rm -rf "$orig_path"
-    fi
+    # Deliberately do NOT remove orig_path. It differs from restore_to ONLY in
+    # the REDIRECT case (fat1_X and fat2_X coexisted; execute rewrote fat2_X in
+    # place and LEFT fat1_X untouched, so restore_to=fat2_X). orig_path is then
+    # the pre-existing fat1_X the migration never modified — deleting it on
+    # rollback would destroy a file that predated the migration, which is
+    # exactly what rollback must preserve. (Bug F.)
 
-    safe_mkdir_p "$(dirname "$restore_to")"
-    if ! cp -a "$bkp" "$restore_to"; then
+    if ! backup_cp "$bkp" "$restore_to"; then
         warn "cp -a failed restoring $restore_to from $bkp"
         return 1
     fi
@@ -570,26 +548,10 @@ run_rollback() {
     declare -A ts_for_path
     declare -A bkp_for_path
     declare -A newp_for_path
-    local orig newp bkp ts status
-
-    local tmp_log
-    tmp_log=$(mktemp)
-    tail -n +2 "$TRACKING_FILE" > "$tmp_log"
-
-    # Read forward; later entries overwrite earlier. After the loop,
-    # latest_status[path] holds the most recent status.
-    while IFS=, read -r orig newp bkp ts status; do
-        orig=$(csv_strip_field "$orig")
-        newp=$(csv_strip_field "$newp")
-        bkp=$(csv_strip_field "$bkp")
-        ts=$(csv_strip_field "$ts")
-        status=$(csv_strip_field "$status")
-        latest_status["$orig"]="$status"
-        ts_for_path["$orig"]="$ts"
-        bkp_for_path["$orig"]="$bkp"
-        newp_for_path["$orig"]="$newp"
-    done < "$tmp_log"
-    rm -f "$tmp_log"
+    # latest_status[path] = most recent status; the parallel maps carry the
+    # latest new_path / backup_path / timestamp for that path.
+    tracking_load_latest "$TRACKING_FILE" latest_status newp_for_path bkp_for_path ts_for_path
+    local orig   # reused by the reverse-walk loop below
 
     # Apply rollback in reverse insertion order. We need the order, so do
     # a second pass walking the tracking file in reverse and skipping paths
@@ -675,23 +637,7 @@ validate_rollback() {
     declare -A rb_bkp
     declare -A rb_newp
     declare -A rb_ts
-
-    local orig newp bkp ts status
-    local tmp_log
-    tmp_log=$(mktemp)
-    tail -n +2 "$TRACKING_FILE" > "$tmp_log"
-    while IFS=, read -r orig newp bkp ts status; do
-        orig=$(csv_strip_field "$orig")
-        newp=$(csv_strip_field "$newp")
-        bkp=$(csv_strip_field "$bkp")
-        ts=$(csv_strip_field "$ts")
-        status=$(csv_strip_field "$status")
-        rb_status["$orig"]="$status"
-        rb_bkp["$orig"]="$bkp"
-        rb_newp["$orig"]="$newp"
-        rb_ts["$orig"]="$ts"
-    done < "$tmp_log"
-    rm -f "$tmp_log"
+    tracking_load_latest "$TRACKING_FILE" rb_status rb_newp rb_bkp rb_ts
 
     # Collect rolled-back directory paths so we can skip child rows that
     # were already restored as part of the parent directory rollback.
@@ -887,21 +833,8 @@ run_validate() {
     declare -A latest_status
     declare -A new_for
     declare -A ts_for
-    local orig newp bkp ts status
-
-    local tmp_log
-    tmp_log=$(mktemp)
-    tail -n +2 "$TRACKING_FILE" > "$tmp_log"
-    while IFS=, read -r orig newp bkp ts status; do
-        orig=$(csv_strip_field "$orig")
-        newp=$(csv_strip_field "$newp")
-        ts=$(csv_strip_field "$ts")
-        status=$(csv_strip_field "$status")
-        latest_status["$orig"]="$status"
-        new_for["$orig"]="$newp"
-        ts_for["$orig"]="$ts"
-    done < "$tmp_log"
-    rm -f "$tmp_log"
+    declare -A bkp_for   # filled but unused here — run_validate recomputes via backup_path_for()
+    tracking_load_latest "$TRACKING_FILE" latest_status new_for bkp_for ts_for
 
     local path
     for path in "${!latest_status[@]}"; do
@@ -966,9 +899,10 @@ main() {
     esac
 }
 
-# Only run main when executed; allow other scripts to source this for
-# access to MIGRATION_MAP, derive_reverse_map result, and helpers like
-# backup_path_for() in test harnesses.
+# Only run main when executed, never when sourced. finder.sh and validate.sh
+# used to source this file for MIGRATION_MAP / backup_path_for(); they now
+# source the migration_map.sh and backup.sh modules directly, so nothing
+# sources migrator.sh anymore. The guard is kept regardless — correct and cheap.
 if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
     main "$@"
 fi

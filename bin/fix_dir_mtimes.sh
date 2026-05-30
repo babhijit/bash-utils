@@ -118,29 +118,63 @@ echo ""
 # Emit "<depth>\t<path>\0" for every directory whose own mtime > cutoff.
 # Depth = number of slashes in the path; deepest-first sort by depth lets
 # children get corrected before their parents are computed.
+#
+# Important: find is run separately and its output captured to a temp file,
+# NOT piped directly to awk. Reason: GNU find returns exit code 1 if it
+# encounters ANY unreadable subdirectory (even with 2>/dev/null suppressing
+# the messages). Under `set -euo pipefail`, that exit code propagates and
+# kills the script silently between the header and Phase 1's count line.
+# Splitting find and awk decouples find's failure from awk's pipe.
 
+raw=$(mktemp)
 impacted=$(mktemp)
 sorted=$(mktemp)
-trap 'rm -f "$impacted" "$sorted"' EXIT
+trap 'rm -f "$raw" "$impacted" "$sorted"' EXIT
 
-find "$ROOT" -type d -printf '%T@\t%p\0' 2>/dev/null \
-    | awk -v RS='\0' -v c="$CUTOFF_EPOCH" -F'\t' '
-        {
-            n = int($1)
-            if (n > c) {
-                depth = gsub("/", "/", $2)
-                printf "%d\t%s%c", depth, $2, 0
-            }
+# Capture find's output; tolerate non-zero exit (partial reads are OK).
+find "$ROOT" -type d -printf '%T@\t%p\0' 2>/dev/null > "$raw" || true
+
+raw_size=$(stat -c '%s' "$raw" 2>/dev/null || echo 0)
+if [ "$raw_size" -eq 0 ]; then
+    echo "Phase 1: find produced no output under $ROOT."
+    echo "         (No readable directories? Wrong --root? Empty tree?)"
+    exit 0
+fi
+
+# Filter to directories with mtime > cutoff, prefixed with their depth
+# (number of '/' chars in the path) so we can sort deepest-first next.
+awk -v RS='\0' -v c="$CUTOFF_EPOCH" -F'\t' '
+    {
+        n = int($1)
+        if (n > c) {
+            depth = gsub("/", "/", $2)
+            printf "%d\t%s%c", depth, $2, 0
         }
-    ' > "$impacted"
+    }
+' "$raw" > "$impacted"
 
 # Count NUL-delimited records.
 impacted_count=$(tr -cd '\0' < "$impacted" | wc -c | tr -d ' ')
-echo "Phase 1: $impacted_count directories with mtime > cutoff"
+echo "Phase 1: $impacted_count directories with mtime > cutoff (out of $(tr -cd '\0' < "$raw" | wc -c | tr -d ' ') total)"
 
 if [ "$impacted_count" -eq 0 ]; then
     echo "Nothing to do."
+    echo ""
+    echo "If you expected matches, double-check:"
+    echo "  - --cutoff '$CUTOFF' resolved to epoch $CUTOFF_EPOCH ($CUTOFF_HUMAN)."
+    echo "  - This is the threshold; directories must have mtime > this to be picked."
+    echo "  - Sample the newest 3 directories under --root for comparison:"
+    find "$ROOT" -type d -printf '%T@\t%TY-%Tm-%Td %TH:%TM:%TS\t%p\n' 2>/dev/null \
+        | sort -rn | head -3 | awk -F'\t' '{ printf "      %s  %s\n", $2, $3 }'
     exit 0
+fi
+
+if [ "$VERBOSE" -eq 1 ]; then
+    echo ""
+    echo "Impacted directories (deepest-first sample, up to 10):"
+    sort -z -rn -t$'\t' -k1,1 "$impacted" \
+        | awk -v RS='\0' -F'\t' 'NR<=10 { printf "  %s\n", $2 }'
+    echo ""
 fi
 
 # Sort by depth descending (deepest first), then strip the depth field.
