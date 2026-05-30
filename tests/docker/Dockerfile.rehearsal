@@ -1,0 +1,63 @@
+# =============================================================================
+# Dockerfile.rehearsal
+#
+# A faithful, *login-able* rehearsal of the FAT1 -> FAT2 migration host, so the
+# scripts can be exercised exactly as they will run on the real RHEL7 box
+# BEFORE touching it. This is the difference between `docker run --rm` (good for
+# CI verification) and a standing host you `su -` / ssh into and operate.
+#
+# What it reproduces from the real host:
+#   - bash 4.2.46 + GNU coreutils + OpenSSL 1.0.2k   (the centos:7 base itself)
+#   - rsync                                          (selective_copy needs it;
+#                                                     installed via CentOS vault)
+#   - TWO unprivileged unix accounts, mirroring the host's split:
+#       opc_d1  owns  /applications/opc_d1   (FAT1 / SOURCE, read-only in use)
+#       opc_d2  owns  /applications/opc_d2   (FAT2 / TARGET, migrated in place)
+#       each can READ both trees, WRITE only its own  (dirs 0755, own:user)
+#   - NO sudo (matches the host): the image is BUILT as root, but you WORK by
+#     `su - opc_dX`, landing in an unprivileged login shell with no sudo — the
+#     same constraint the operator has on the real box.
+#   - /tmp as the only shared-writable location (sticky 1777, as shipped).
+#
+# What it does NOT reproduce (rehearsal limits, with mitigations):
+#   - SELinux / PAM limits / real disk pressure -> validate those on the host.
+#   - The real directory contents               -> populate the trees with
+#     mock_build.sh / setup_mock_env.sh as the right user (see RUNBOOK).
+#   - Distinct real UIDs across machines         -> here both are local; fine
+#     for the /tmp cross-user handoff selective_copy exercises.
+#
+# REHEARSAL ONLY. This image is never the real host and must never be pointed
+# at a real /applications tree.
+# =============================================================================
+FROM centos:7
+
+# centos:7 is EOL; its mirrorlist service is gone. Repoint yum at the vault
+# archive so package installs still work, then add rsync + sshd.
+RUN sed -i 's|^mirrorlist=|#mirrorlist=|g; s|^#\{0,1\}baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo \
+ && yum -y install rsync openssh-server \
+ && yum clean all \
+ && mkdir -p /var/run/sshd \
+ && ssh-keygen -A
+
+# Two accounts mirroring the host. `fatshare` is a shared supplementary group
+# (selective_copy's optional --shared-group can target it for the /tmp handoff);
+# the read-both/write-own property itself comes from 0755 + per-user ownership.
+RUN groupadd fatshare \
+ && useradd -m -G fatshare opc_d1 \
+ && useradd -m -G fatshare opc_d2 \
+ && echo 'opc_d1:rehearse' | chpasswd \
+ && echo 'opc_d2:rehearse' | chpasswd
+
+# The two trees: each owned by its user, world-readable, world-write-denied —
+# i.e. read both, write only your own, exactly like the host.
+RUN mkdir -p /applications/opc_d1 /applications/opc_d2 \
+ && chown opc_d1:fatshare /applications/opc_d1 \
+ && chown opc_d2:fatshare /applications/opc_d2 \
+ && chmod 0755 /applications/opc_d1 /applications/opc_d2
+
+# The single directory the operator deploys ALL scripts into on the host.
+RUN mkdir -p /tmp/test_f2/bin && chmod 1777 /tmp/test_f2
+
+# Keep the container alive; you "log in" via `docker exec ... su - opc_dX`
+# (or start sshd for the full ssh ritual — see rehearse.sh `ssh-on`).
+CMD ["sleep", "infinity"]
