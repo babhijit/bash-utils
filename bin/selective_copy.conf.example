@@ -1,51 +1,83 @@
 # =============================================================================
-# selective_copy.conf.example — job config for selective_copy.sh
+# selective_copy.conf.example — job config for selective_copy.sh (PHASED copy)
 #
-# Copy to e.g. selective_copy.conf, edit for your job, then:
-#   # as the SOURCE user (e.g. opc_d1):
+# Copy to e.g. selective_copy.conf, edit for your job, then run the phased
+# workflow (alternate the two logins; there is NO synchronization between them):
+#
+#   # ONCE, as the SOURCE user (e.g. opc_d1): plan the batches
+#   bash selective_copy.sh --mode plan    --config ./selective_copy.conf \
+#        --source-user opc_d1 --target-user opc_d2
+#
+#   # REPEAT until `--mode status` shows all batches DEPLOYED:
+#   #   as SOURCE user:
 #   bash selective_copy.sh --mode prepare --config ./selective_copy.conf \
 #        --source-user opc_d1 --target-user opc_d2
-#   # as the TARGET user (e.g. opc_d2):
+#   #   as TARGET user:
 #   bash selective_copy.sh --mode deploy  --config ./selective_copy.conf \
-#        --target-user opc_d2 --staging-dir /tmp/test_f2/migration
+#        --target-user opc_d2
+#
+#   # ONCE, as the TARGET user: symlinks + transforms + directory mtime reconcile
+#   bash selective_copy.sh --mode finalize --config ./selective_copy.conf \
+#        --target-user opc_d2
 #
 # This file is SOURCED AS BASH by selective_copy.sh — use only operator-authored
 # configs (same trust level as the script). Variables you omit default to empty
-# (no items) / mktemp staging. CLI flags (--source-base/--target-base/
-# --staging-dir) override anything set here.
+# (no items). CLI flags (--source-base/--target-base/--staging-dir/--state-dir/
+# --budget-bytes) override anything set here.
 # =============================================================================
 
 # --- Base directories -------------------------------------------------------
-# prepare reads under SOURCE_BASE_DIR and records TARGET_BASE_DIR for deploy;
-# deploy writes under TARGET_BASE_DIR. No hardcoded defaults — set them here.
+# plan/prepare read under SOURCE_BASE_DIR; deploy/finalize write under
+# TARGET_BASE_DIR. No hardcoded defaults — set them here.
 SOURCE_BASE_DIR="/applications/opc_d1"
 TARGET_BASE_DIR="/applications/opc_d2"
 
-# --- Staging directory (optional) -------------------------------------------
-# The /tmp handoff area prepare writes and deploy reads. Leave unset to have
-# prepare mktemp a fresh /tmp/scopy.XXXX and print it; set it for a fixed,
-# predictable path (must be empty/absent when prepare runs).
+# --- Staging + state directories --------------------------------------------
+# STAGING_DIR  : the /tmp handoff area. ONE batch lives here at a time; it is
+#                DRAINED after each deploy so peak /tmp usage never exceeds one
+#                batch. Must be on the shared-writable filesystem (/tmp here).
+# STATE_DIR    : where the plan, per-batch manifests, attribute-reference CSVs,
+#                progress markers, and logs live. It PERSISTS across batches and
+#                across the two logins (both users read it; each writes only its
+#                own markers), so it is deliberately NOT inside STAGING_DIR.
+#                Defaults to "<STAGING_DIR>.state" if left unset.
 STAGING_DIR="/tmp/test_f2/migration"
+STATE_DIR="/tmp/test_f2/migration.state"
+
+# --- Per-batch size budget --------------------------------------------------
+# The planner packs files so each batch stays at or under this many BYTES. Set
+# it BELOW your /tmp hard cap, with headroom for filesystem overhead. The DR
+# host caps /tmp at ~1 GB, so 950 MiB is a safe default. Override per run with
+# --budget-bytes.
+#   950 MiB = 996147200 ;  900 MiB = 943718400 ;  600 MiB = 629145600
+STAGING_BUDGET_BYTES=996147200
 
 # --- Items to copy ----------------------------------------------------------
 # "src_name|dest_name": src_name relative to SOURCE_BASE_DIR, dest_name relative
-# to TARGET_BASE_DIR. (Mirror the convention your deploy expects.)
+# to TARGET_BASE_DIR. A directory item copies its whole subtree (file-granular
+# batching descends into it); a single-file item copies that one file. src_name
+# and dest_name may differ (the item is renamed at the target).
 COPY_MAPPING=(
     "bin|bin/"
     "etc|etc/"
     "security|security/"
 )
 
-# --- Symlinks to (re)create at the target -----------------------------------
+# --- Symlinks to (re)create at the target (applied in --mode finalize) ------
 # "src_link|dest_link|dest_target"
 SYMBOLIC_LINK_MAPPING=()
 
-# --- rsync exclusions, per source item --------------------------------------
-# "src_name:relative_pattern"
+# --- rsync/enumeration exclusions, per source item --------------------------
+# "src_name:relative_pattern" — matching paths are skipped during planning.
 EXCLUDE_MAPPING=(
     "bin:*.log"
 )
 
-# --- Post-copy renames / symlink retargets at the target --------------------
+# --- Post-copy renames / symlink retargets at the target (in --mode finalize)
 # "rel_path|new_name|new_link_target"  (empty new_link_target = plain rename)
 NESTED_ITEM_TRANSFORM=()
+
+# --- Shared group (optional) ------------------------------------------------
+# If both users belong to a common group, pass --shared-group <group> on the
+# CLI to tighten staging/state perms to 2770 (setgid) instead of world-rwx.
+# (Cannot be created here — no sudo — so it is a CLI flag, not a config var.)

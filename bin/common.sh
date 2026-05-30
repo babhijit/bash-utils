@@ -76,9 +76,12 @@ log() {
     local line
     line="$(date +'%Y-%m-%d %H:%M:%S') - ${level} - ${message}"
     if [ -n "${LOG_FILE:-}" ]; then
-        # `|| true` so a log-write failure (e.g. disk full) does not kill
-        # the caller via set -e / pipefail.
-        echo "$line" >> "$LOG_FILE" 2>/dev/null || true
+        # `|| true` so a log-write failure (e.g. disk full, or a file owned by
+        # another user) does not kill the caller via set -e / pipefail. The
+        # braces are load-bearing: a simple `>> file 2>/dev/null` still lets the
+        # *open-for-append* failure print to the real stderr (the redirect is
+        # attempted before 2>/dev/null binds); grouping suppresses that too.
+        { echo "$line" >> "$LOG_FILE"; } 2>/dev/null || true
     fi
     echo "$line" >&2
 }
@@ -469,4 +472,98 @@ new_run_id() {
     ts="$(date +'%Y%m%d_%H%M%S')"
     hex="$(head -c 3 /dev/urandom | od -An -tx1 | tr -d ' \n')"
     printf '%s_%s' "$ts" "$hex"
+}
+
+# -----------------------------------------------------------------------------
+# CSV writing (path-safe complement to csv_strip_field)
+# -----------------------------------------------------------------------------
+#
+# csv_quote_field <value>
+# Returns <value> as a quoted CSV field: always wrapped in double quotes, with
+# any internal double quote doubled ("" per RFC 4180). Always-quoting keeps the
+# writer trivial and the output uniform, and lets a value containing commas,
+# spaces, quotes, or leading/trailing whitespace round-trip safely back through
+# csv_strip_field on read. Use this whenever emitting a path into a CSV — unix
+# paths may legally contain commas and spaces, which an unquoted field corrupts.
+#
+# Example:
+#   csv_quote_field 'a,b "c"'   ->   "a,b ""c"""
+csv_quote_field() {
+    local field="${1-}"
+    field="${field//\"/\"\"}"
+    printf '"%s"' "$field"
+}
+
+# -----------------------------------------------------------------------------
+# Human-readable sizes
+# -----------------------------------------------------------------------------
+#
+# human_bytes <n>
+# Formats a byte count as a short human string (e.g. "948.5 MB"). Integer-only
+# math — bash has no floating point, and these scripts target bash 4.2 with no
+# dependency on bc/python. One decimal digit of precision. Non-numeric or empty
+# input is treated as 0. Caps at PB (ample for a multi-GB migration).
+human_bytes() {
+    local b="${1:-0}"
+    case "$b" in *[!0-9]*|'') b=0 ;; esac
+    local units=(B KB MB GB TB PB)
+    local i=0 v="$b"
+    while [ "$v" -ge 1024 ] && [ "$i" -lt 5 ]; do
+        v=$(( v / 1024 )); i=$(( i + 1 ))
+    done
+    if [ "$i" -eq 0 ]; then
+        printf '%s %s' "$b" "${units[0]}"
+        return 0
+    fi
+    local divisor=1 k=0
+    while [ "$k" -lt "$i" ]; do divisor=$(( divisor * 1024 )); k=$(( k + 1 )); done
+    printf '%s.%s %s' "$(( b / divisor ))" "$(( (b % divisor) * 10 / divisor ))" "${units[$i]}"
+}
+
+# -----------------------------------------------------------------------------
+# Machine-readable event log (JSONL)
+# -----------------------------------------------------------------------------
+#
+# Two logging channels run in parallel through these scripts:
+#   - HUMAN  : log()/info()/warn()/success() -> stderr (+ LOG_FILE), timestamped
+#   - MACHINE: emit_event()                  -> a .jsonl file, one object/line
+# The machine channel exists so a long, batched, multi-session copy can be
+# watched/parsed with jq (progress, which batch, failures) without scraping
+# human prose. It is intentionally schema-light: every event is a flat object
+# of string values with an auto "ts" (epoch seconds); consumers coerce types.
+
+# _json_escape <string>  (module-private)
+# Minimal JSON string escaper: backslash, double-quote, tab, newline, CR.
+_json_escape() {
+    local s="${1-}"
+    s="${s//\\/\\\\}"
+    s="${s//\"/\\\"}"
+    s="${s//$'\t'/\\t}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    printf '%s' "$s"
+}
+
+# emit_event <jsonl_file> <key=value> [<key=value> ...]
+# Appends ONE JSON object (JSONL) describing an event. A leading "ts" (epoch
+# seconds) is added automatically. Keys and values are JSON-escaped; values are
+# always emitted as strings (jq numeric coercion handles the rest). Best-effort:
+# a logging failure must NEVER abort the copy, so the append is guarded with
+# `|| true`. A "key=value" with extra '=' keeps everything after the first '='
+# as the value (so paths/URLs survive).
+emit_event() {
+    local file="${1-}"; shift || true
+    [ -n "$file" ] || return 0
+    local out ts kv k v
+    ts="$(date +%s)"
+    out="$(printf '{"ts":"%s"' "$ts")"
+    for kv in "$@"; do
+        k="${kv%%=*}"
+        v="${kv#*=}"
+        out+="$(printf ',"%s":"%s"' "$(_json_escape "$k")" "$(_json_escape "$v")")"
+    done
+    out+='}'
+    # Braces required so an open-for-append failure (e.g. a file another user
+    # owns) is suppressed too, not just printf's stderr. Best-effort by design.
+    { printf '%s\n' "$out" >> "$file"; } 2>/dev/null || true
 }

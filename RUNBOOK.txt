@@ -22,10 +22,11 @@
       BIN=/tmp/test_f2/bin
       SRC_ROOT=/applications/opc_d1          # FAT1 tree (selective_copy source)
       TGT_ROOT=/applications/opc_d2          # FAT2 tree (migrated IN PLACE)
-      STAGING=/tmp/test_f2/migration         # cross-user copy handoff
+      STAGING=/tmp/test_f2/migration         # cross-user copy handoff (ONE batch at a time)
+      STATE=/tmp/test_f2/migration.state     # selective_copy plan/markers/attrs CSV/logs (persists)
       WORKDIR=/tmp/migration_f2              # migrator backups + tracking (opc_d2)
       CSV=/tmp/test_f2/fat2.csv              # 3-col input (Name,Absolute_Path,Last_Modified)
-      CONF=/tmp/test_f2/selective_copy.conf  # job config for selective_copy
+      CONF=/tmp/test_f2/selective_copy.conf  # job config for selective_copy (sets STATE + budget)
 
   The two phases:
     PHASE 0  selective_copy  — get fat1's content into the fat2 tree (cross-user).
@@ -58,12 +59,14 @@
 ================================================================================
 
   Purpose: copy items from /applications/opc_d1 (as opc_d1) into
-  /applications/opc_d2 (as opc_d2), via a world-/group-readable handoff in
-  /tmp. SKIP this phase if /applications/opc_d2 is already populated (in this
-  DR the copy was run earlier; the migrator phase below is the active work).
+  /applications/opc_d2 (as opc_d2), via a world-/group-readable handoff in /tmp.
+  /tmp has a HARD ~1 GB cap but the data can be ~7 GB, so the copy runs in
+  size-bounded BATCHES: stage one batch (<= budget) -> deploy it -> drain /tmp
+  -> repeat. Peak /tmp use never exceeds one batch.
 
-  selective_copy is config-driven — NOTHING job-specific is hardcoded. Create
-  the job config once:
+  SKIP this phase if /applications/opc_d2 is already fully populated.
+
+  selective_copy is config-driven — NOTHING job-specific is hardcoded:
 
     cp $BIN/selective_copy.conf.example $CONF
     $EDITOR $CONF
@@ -71,34 +74,56 @@
   Set in $CONF:
     SOURCE_BASE_DIR="/applications/opc_d1"
     TARGET_BASE_DIR="/applications/opc_d2"
-    STAGING_DIR="/tmp/test_f2/migration"
-    COPY_MAPPING=( "item|item/" ... )      # the items to copy — operator input
+    STAGING_DIR="/tmp/test_f2/migration"          # one batch lives here at a time
+    STATE_DIR="/tmp/test_f2/migration.state"      # plan/markers/attrs CSV/logs (persists)
+    STAGING_BUDGET_BYTES=996147200                # 950 MiB; keep below the /tmp cap
+    COPY_MAPPING=( "item|item" ... )              # the items to copy — operator input
     # optional: SYMBOLIC_LINK_MAPPING, EXCLUDE_MAPPING, NESTED_ITEM_TRANSFORM
 
-  Step 0.1 — Prepare (run as opc_d1)
-  ───────────────────────────────────
+  The two logins run INDEPENDENTLY — NO synchronization between them. Each writes
+  only its own marker files in STATE_DIR; you drive the alternation.
+
+  Step 0.1 — Plan the batches (ONCE, as opc_d1)
+  ──────────────────────────────────────────────
+    bash $BIN/selective_copy.sh --mode plan --config $CONF \
+        --source-user opc_d1 --target-user opc_d2
+
+    - Bin-packs files into batches each <= the budget, records every directory's
+      mode+mtime, writes per-batch manifests under STATE_DIR.
+    - Prints the batch count + sizes. WARNS on any single file larger than a batch.
+
+  Step 0.2 — Rinse and repeat until all batches DEPLOYED
+  ───────────────────────────────────────────────────────
+    # as opc_d1 — stages the next pending batch into /tmp, then stops:
     bash $BIN/selective_copy.sh --mode prepare --config $CONF \
         --source-user opc_d1 --target-user opc_d2
 
-    - Refuses to run as root. Asserts `id -un` == opc_d1.
-    - rsyncs the configured items into $STAGING, records lstat (perms+mtime),
-      sets the staged content readable by opc_d2.
-    - If STAGING_DIR is unset in $CONF, prepare mktemps a fresh /tmp/scopy.XXXX
-      and prints it; pass that to deploy instead.
-
-  Step 0.2 — Deploy (run as opc_d2)
-  ──────────────────────────────────
+    # as opc_d2 — deploys the staged batch, restores attrs, drains /tmp:
     bash $BIN/selective_copy.sh --mode deploy --config $CONF \
-        --target-user opc_d2 --staging-dir $STAGING
+        --target-user opc_d2
 
-    - Asserts `id -un` == opc_d2 and that staging was prepared for opc_d2.
-    - Tamper check: refuses if any staged file is newer than the state file.
-    - Copies items into /applications/opc_d2, applies any nested transforms,
-      restores perms + mtimes.
+    - prepare auto-advances (no batch numbers to track). A free-space preflight
+      aborts BEFORE rsync if the batch won't fit /tmp.
+    - deploy restores original perms+mtime from the per-batch reference CSV (NOT
+      ownership — target stays opc_d2-owned), then drains staging.
+    - Live console progress via rsync --info=progress2 (moving %/rate, not frozen).
+    - Progress anytime (either user):
+        bash $BIN/selective_copy.sh --mode status --config $CONF
+    - On failure: a *_FAILED marker + reason is written; fix and re-run the same
+      command — it RESUMES that batch (prepare cleans any partial staging itself).
 
-  Step 0.3 — Cleanup staging (either owner)
-  ──────────────────────────────────────────
-    bash $BIN/selective_copy.sh --mode cleanup --staging-dir $STAGING
+  Step 0.3 — Finalize (ONCE, as opc_d2, after all batches DEPLOYED)
+  ──────────────────────────────────────────────────────────────────
+    bash $BIN/selective_copy.sh --mode finalize --config $CONF \
+        --target-user opc_d2
+
+    - Creates configured symlinks, applies nested transforms, then reconciles
+      every directory's mode+mtime. (Dir mtimes are fixed HERE, not per batch: a
+      dir written across several batches has a bumped mtime until reconciled.)
+
+  Step 0.4 — Cleanup staging (+ optionally the plan/state)
+  ──────────────────────────────────────────────────────────
+    bash $BIN/selective_copy.sh --mode cleanup --config $CONF [--cleanup-state]
 
 
 ================================================================================
@@ -235,8 +260,10 @@
   /tmp WIPED (reboot, tmpfiles.d sweeper):
     Backups + tracking gone — cannot rollback.
     a. Paths not yet processed are still original.
-    b. Re-run PHASE 0 (selective_copy prepare as opc_d1, deploy as opc_d2) to
-       restore /applications/opc_d2 from fat1, then re-migrate.
+    b. Re-run PHASE 0 (plan as opc_d1, then the prepare/deploy loop, then
+       finalize as opc_d2) to restore /applications/opc_d2 from fat1, then re-migrate.
+       (selective_copy resumes from its STATE_DIR markers if those survived; if
+       /tmp took the state dir too, just re-run plan — it re-derives the batches.)
     c. This is why we insist on one continuous session.
 
   CLEANUP ALREADY RAN BUT MIGRATION IS WRONG:
@@ -318,7 +345,14 @@
      && yum -y install rsync && yum clean all
     DOCKERFILE
     docker run --rm -v "$PWD":/work -w /work bashutils7:rsync bash tests/selective_copy_test.sh
+    docker run --rm -v "$PWD":/work -w /work bashutils7:rsync bash tests/phased_copy_test.sh
+    docker run --rm -v "$PWD":/work -w /work bashutils7:rsync bash tests/migrator_preflight_test.sh
 
+  tests/phased_copy_test.sh proves the batched copy as one user (content/mode/
+  mtime/dir-mtime exactness, rename/exclude/empty-dir/spaces/oversize, resume,
+  free-space guard); selective_copy_test.sh proves the SAME across TWO real users
+  (the cross-user stage/deploy/DRAIN handoff). migrator_preflight_test.sh proves
+  the migrator backup free-space guard fires before any mutation.
   tests/setup_mock_env.sh builds a realistic mock source (the full fat2.csv
   dataset in real per-type content + all edge cases) under /tmp/mock_src; the
   runners above exercise it end-to-end.
@@ -328,13 +362,16 @@
   QUICK REFERENCE
 ================================================================================
 
-  selective_copy.sh:
-    --mode prepare|deploy|cleanup   prepare(as opc_d1) | deploy(as opc_d2) | cleanup
-    --config <file>                 sourced bash: base dirs, items, staging
+  selective_copy.sh (phased, cross-user; plan once, loop prepare/deploy, finalize):
+    --mode plan|prepare|deploy|finalize|status|cleanup
+                                    plan+prepare(opc_d1) | deploy+finalize(opc_d2)
+    --config <file>                 sourced bash: base dirs, items, staging, budget
     --source-user / --target-user   pinned `id -un` sanity checks
-    --staging-dir <path>            handoff dir (overrides config STAGING_DIR)
+    --staging-dir / --state-dir     one batch here / plan+markers+attrs+logs (persists)
+    --budget-bytes <N>              per-batch ceiling (default 950 MiB = 996147200)
     --source-base / --target-base   override config base dirs
-    --shared-group <grp>            2770+setgid staging instead of 777
+    --shared-group <grp>            2770+setgid staging/state instead of 0777
+    --cleanup-state                 (cleanup) also remove the plan/state dir
 
   mock_build.sh:
     --csv <path>          3-column CSV (required)

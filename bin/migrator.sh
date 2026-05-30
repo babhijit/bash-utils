@@ -460,6 +460,19 @@ migrate_file() {
     fi
 }
 
+# preflight_sum_row <name> <path> <ts>   (csv_read_3col callback)
+# Accumulates an estimate of the backup footprint into the caller's
+# _PREFLIGHT_BYTES (visible via dynamic scope): du -sb of each existing CSV
+# path. du counts a directory's whole subtree and a file's real bytes; a
+# symlink counts as ~0. Missing paths are skipped (process_row handles those).
+preflight_sum_row() {
+    local path="$2" sz
+    { [ -e "$path" ] || [ -L "$path" ]; } || return 0
+    sz="$(du -sb "$path" 2>/dev/null | cut -f1)" || sz=0
+    [ -n "$sz" ] || sz=0
+    _PREFLIGHT_BYTES=$(( _PREFLIGHT_BYTES + sz ))
+}
+
 run_execute() {
     info "Mode: EXECUTE  root=$ROOT  workdir=$WORKDIR  dry_run=$DRY_RUN"
     safe_mkdir_p "$WORKDIR"
@@ -472,6 +485,20 @@ run_execute() {
     fi
 
     [ -f "$CSV_FILE" ] || die "CSV not found: $CSV_FILE"
+
+    # Free-space preflight (before the countdown so it aborts instantly, not
+    # after a 5s wait): estimate the backup footprint — cp -a copies every
+    # existing CSV path into WORKDIR before mutating it — and refuse up front if
+    # WORKDIR cannot hold it. This guards the costly failure of filling /tmp
+    # mid-run and leaving a half-backed-up tree. Most rows are small text
+    # configs, but a large file/dir listed in the CSV would matter. Skipped in
+    # dry-run (no backups are taken). +32 MiB headroom for tracking + overhead.
+    if [ "$DRY_RUN" -ne 1 ]; then
+        local _PREFLIGHT_BYTES=0
+        csv_read_3col "$CSV_FILE" preflight_sum_row
+        info "Estimated backup footprint: $(human_bytes "$_PREFLIGHT_BYTES") into $WORKDIR"
+        check_free_space_bytes "$WORKDIR" "$(( _PREFLIGHT_BYTES + 33554432 ))"
+    fi
 
     live_safety_gate
 
