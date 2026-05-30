@@ -179,6 +179,18 @@ docker run --rm -v "$PWD":/work -w /work bashutils7:rsync bash tests/selective_c
 docker run --rm -v "$PWD":/work -w /work bashutils7:rsync bash tests/migrator_preflight_test.sh # migrator backup space guard
 
 
+REHEARSE PHASE 0 OFF-HOST  (dry-run the REAL two-user cross-user copy first)
+---------------------------------------------------------------------------
+# tests/docker stands up a faithful, login-able two-user host (centos:7 + rsync;
+# users opc_d1/opc_d2 owning /applications/opc_d{1,2}; /tmp shared) so you can
+# rehearse the ACTUAL plan -> prepare/deploy -> finalize handoff before the live box:
+bash tests/docker/rehearse.sh build
+bash tests/docker/rehearse.sh up
+bash tests/docker/rehearse.sh login opc_d1     # stage side  (or: rehearse.sh ssh-on for real ssh)
+bash tests/docker/rehearse.sh login opc_d2     # deploy side (second terminal)
+bash tests/docker/rehearse.sh down             # tear down
+
+
 QUICK REFERENCE
 ---------------
 selective_copy.sh  --mode plan|prepare|deploy|finalize|status|cleanup  --config <file>
