@@ -359,6 +359,29 @@
 
 
 ================================================================================
+  REHEARSE PHASE 0 ON A TWO-USER CONTAINER  (dry-run the real cross-user copy)
+================================================================================
+
+  The runners above test the LOGIC. To rehearse the actual cross-user PHASE 0
+  handoff — two real logins, world-/group-readable /tmp staging, the deploy-side
+  drain — before the live host, tests/docker stands up a faithful, login-able
+  centos:7 host: bash 4.2.46 + rsync, users opc_d1/opc_d2 owning
+  /applications/opc_d{1,2}, NO sudo, /tmp shared. From the repo checkout:
+
+    bash tests/docker/rehearse.sh build            # one-time image build
+    bash tests/docker/rehearse.sh up               # start the standing container
+    bash tests/docker/rehearse.sh login opc_d1     # "log in" as the stage user
+    bash tests/docker/rehearse.sh login opc_d2     # second terminal: the deploy user
+    bash tests/docker/rehearse.sh ssh-on           # optional: real ssh -p 2222 opc_dX@localhost
+    bash tests/docker/rehearse.sh down             # stop + remove
+
+  Inside, run the SAME plan -> prepare/deploy -> finalize commands you will run on
+  the live box (the repo's bin/ is mounted at /tmp/test_f2/bin). Populate
+  /applications/opc_d1 first (e.g. mock_build.sh as opc_d1) so prepare has
+  something to copy. Rehearsal only — never point it at a real /applications tree.
+
+
+================================================================================
   QUICK REFERENCE
 ================================================================================
 
