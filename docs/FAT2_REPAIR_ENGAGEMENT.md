@@ -220,6 +220,22 @@ FAT2 authenticates **as FAT1** (same cryptographic identity) — fine for this d
 env. Net effect: certs rarely force a rebuild — the security subsystem becomes a
 copy + repath + chmod punch-list.
 
+**OPERATOR-OVERRIDE list (takes precedence over everything).** For a SMALL set of
+items (configs and/or certs) the operator knows the exact value/target and will
+supply it; those are applied **verbatim** at the named location — NOT map-rewritten
+and NOT FAT1-reused. Precedence per FAT2 file, highest first:
+1. **operator override** — use exactly the supplied config/cert at the supplied path;
+2. **cert/key/keystore/wallet** → reuse FAT1 (copy → repath → fix perms);
+3. **text config** → apply the `MIGRATION_MAP` expected-rewrite;
+4. **binary / everything else** → copy as-is (must stay byte-identical).
+Per override item the operator gives: target path (rel to `/applications/opc_d2`),
+the exact content/value or cert to use, and scope (whole-file vs a specific
+key/value). **Audit interaction:** override paths would otherwise fail the
+rewrite-aware compare (they intentionally differ from the map-rewrite) and show as
+DRIFT — so the LEVEL-2 audit takes an `OVERRIDE_PATHS` list and marks those
+`OPERATOR-OVERRIDE (expected to differ)` instead of judging them. (To be wired into
+`audit_env.sh` once the path list is known — relevant only at LEVEL-2 drill-down.)
+
 ### Phase 3 — Plan (→ approval)
 Port-remap table, path-remap table, permission/ownership model, per-cert
 disposition, and the **repair-vs-rebuild recommendation backed by the counts**.
