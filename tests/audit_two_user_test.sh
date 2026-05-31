@@ -222,6 +222,11 @@ echo "[rewrite-aware compare: binary]"
 assert_grep "$RPT/audit.txt" 'CORRUPT\(bin\) +security/keystore\.jks'       "keystore differs (binary, never rewritten) -> CORRUPT"
 assert_grep "$RPT/audit.txt" 'IDENTICAL +lib/common\.jar'                   "common.jar byte-identical -> IDENTICAL"
 
+echo "[heartbeat stays OFF the report]"
+# progress() / count_filter write only to a TTY stderr; in this (non-TTY) run they
+# must be fully silent and must NEVER appear in the report file.
+assert_no_grep "$RPT/audit.txt" '^  \.\. ' "heartbeat (\\r .. lines) never leaks into audit.txt"
+
 echo "[scorecard + verdict present]"
 assert_grep "$RPT/audit.txt" 'SUBSYSTEM SCORECARD'   "subsystem scorecard rendered"
 assert_grep "$RPT/audit.txt" 'security'              "  -> security subsystem row present"

@@ -195,6 +195,29 @@ redact(){ sed -E 's/(([Pp]ass(word)?|[Ss]ecret|[Ss]torepass|[Kk]eypass|[Cc]reden
 # bytes -> MiB with one decimal (no bc; awk handles the float).
 mib(){ awk -v b="${1:-0}" 'BEGIN{printf "%.1f", b/1048576}'; }
 
+# --- Liveness heartbeat (TTY-only; never written to the report) ---------------
+# Deep trees make the finds + hashing run silent for minutes. These print a
+# SINGLE rewriting line to the TERMINAL so the operator sees it is alive. They
+# emit ONLY when stderr is a TTY (no-op under redirect / pipe / cron, so logs and
+# the report stay clean) and ONLY to stderr (never to REPORT). Cost: one awk
+# pass-through on each walk (C-fast) + a modulo test per hash iteration —
+# negligible vs find / sha256 / openssl. Tune with PROGRESS_EVERY; 0 disables.
+_TTY2="$([ -t 2 ] && echo 1 || true)"
+PROGRESS_EVERY="${PROGRESS_EVERY:-200}"
+progress(){ { [ -n "$_TTY2" ] && [ "$PROGRESS_EVERY" != 0 ]; } && printf '\r  .. %-72s' "$*" >&2 || true; }
+progress_done(){ [ -n "$_TTY2" ] && printf '\r%-78s\r' '' >&2 || true; }
+# tick <count> <label>: emit progress every PROGRESS_EVERY items (guards /0).
+tick(){ [ "$PROGRESS_EVERY" = 0 ] && return 0; [ $(( $1 % PROGRESS_EVERY )) -eq 0 ] && progress "$2"; return 0; }
+# count_filter <label>: copy stdin->stdout unchanged; live-count to the TTY every
+# PROGRESS_EVERY lines. Wraps the big `find` walks. Pure pass-through (cat) when
+# not a TTY / disabled, so redirected runs pay ~nothing.
+count_filter(){
+    if [ -z "$_TTY2" ] || [ "$PROGRESS_EVERY" = 0 ]; then cat; return; fi
+    awk -v every="$PROGRESS_EVERY" -v lbl="$1" '
+        { print; n++; if (n % every == 0) printf "\r  .. %s: %d", lbl, n > "/dev/stderr" }
+        END { printf "\r%-78s\r", "" > "/dev/stderr" }'
+}
+
 # Extension set shared by the FAT1 hash manifest and the FAT2 checksum compare,
 # kept in one place so the two sides never drift out of lock-step.
 binary_compare_find_args=( '(' -name '*.jks' -o -name '*.p12' -o -name '*.pfx' \
@@ -240,8 +263,10 @@ do_fat1_manifest() {
     # 1) Full inventory (always). Symlink target (%l) LAST so non-symlink rows
     #    have no INTERNAL empty field -> `IFS=$'\t' read` won't collapse tabs and
     #    shift columns. -mindepth 1 drops the '.' root (no LEADING empty field).
+    progress "FAT1 inventory: walking $FAT1_ROOT .."
     ( cd "$FAT1_ROOT" 2>/dev/null && \
-        find . -mindepth 1 "${PRUNE_EXPR[@]}" -printf '%P\t%y\t%s\t%m\t%u:%g\t%l\n' 2>>"$DEN" ) > "$MAN"
+        find . -mindepth 1 "${PRUNE_EXPR[@]}" -printf '%P\t%y\t%s\t%m\t%u:%g\t%l\n' 2>>"$DEN" ) \
+        | count_filter "FAT1 inventory" > "$MAN"
 
     if [ "$LEVEL" = 2 ]; then
         # 2) Hashes for the compare set. Two kinds, 4-col manifest:
@@ -252,7 +277,9 @@ do_fat1_manifest() {
         #    - kind=binary: keystores/jars/certs (never rewritten). expected = raw;
         #      a FAT2 mismatch means corruption, not migration.
         local -A _seen
+        local _n=0
         if [ "$HAVE_MAP" = 1 ] && [ "${#TOKEN_GREP[@]}" -gt 0 ]; then
+            progress "FAT1 scanning text for migration tokens (reads all text).."
             while IFS= read -r f; do
                 [ -z "$f" ] && continue
                 local rel="${f#$FAT1_ROOT/}"
@@ -262,8 +289,10 @@ do_fat1_manifest() {
                 raw="$(sha256sum "$f" 2>>"$DEN" | awk '{print $1}')"
                 exp="$(expected_hash "$f")"
                 [ -n "$raw" ] && { printf '%s\t%s\trewrite\t%s\n' "$raw" "$exp" "$rel" >> "$HASHF"; _seen["$rel"]=1; }
+                _n=$((_n + 1)); tick "$_n" "FAT1 hashing rewrite candidates: $_n"
             done < <( grep -rIl "${GREP_EXCLUDES[@]+"${GREP_EXCLUDES[@]}"}" "${TOKEN_GREP[@]}" "$FAT1_ROOT" 2>>"$DEN" )
         fi
+        _n=0
         while IFS= read -r rel; do
             [ -z "$rel" ] && continue
             in_scope "$rel" || continue
@@ -272,14 +301,18 @@ do_fat1_manifest() {
             [ -f "$f" ] || continue
             local h; h="$(sha256sum "$f" 2>>"$DEN" | awk '{print $1}')"
             [ -n "$h" ] && printf '%s\t%s\tbinary\t%s\n' "$h" "$h" "$rel" >> "$HASHF"
+            _n=$((_n + 1)); tick "$_n" "FAT1 hashing binaries/certs: $_n"
         done < <( cd "$FAT1_ROOT" 2>/dev/null && \
             find . -mindepth 1 "${PRUNE_EXPR[@]}" -type f "${binary_compare_find_args[@]}" -printf '%P\n' 2>>"$DEN" )
+        progress_done
 
         # 3) Decode FAT1 certs HERE (opc_d2 may not read them later), SCOPE-limited.
         if command -v openssl >/dev/null 2>&1; then
+            _n=0
             while IFS= read -r rel; do
                 [ -z "$rel" ] && continue
                 in_scope "$rel" || continue
+                _n=$((_n + 1)); tick "$_n" "FAT1 decoding certs: $_n"
                 local c="$FAT1_ROOT/$rel"
                 if openssl x509 -in "$c" -noout >/dev/null 2>&1; then
                     {
@@ -295,6 +328,7 @@ do_fat1_manifest() {
         else
             say "(openssl not available — FAT1 cert decode skipped)"
         fi
+        progress_done
     fi
 
     chmod 0644 "$MAN" "$HASHF" "$CERTF" "$DEN" "$REPORT" 2>/dev/null || true
@@ -396,8 +430,10 @@ do_fat2_audit() {
     SHARED_OK="$REPORT_DIR/symlinks_shared_intentional.txt"; SHARED_REV="$REPORT_DIR/symlinks_shared_review.txt"
     OKF2="$REPORT_DIR/symlinks_ok_fat2.txt"
     : > "$STALE"; : > "$BROKEN"; : > "$SHARED_OK"; : > "$SHARED_REV"; : > "$OKF2"
+    local _ln=0
     while IFS=$'\t' read -r rel raw; do
         [ -z "$rel" ] && continue
+        _ln=$((_ln + 1)); tick "$_ln" "FAT2 classifying symlinks: $_ln"
         abs="$FAT2_ROOT/$rel"
         if [ ! -e "$abs" ]; then printf '%s -> %s\n' "$rel" "$raw" >> "$BROKEN"; continue; fi
         resolved="$(readlink -f "$abs" 2>/dev/null || true)"
@@ -414,6 +450,7 @@ do_fat2_audit() {
             fi
         fi
     done < <(cd "$FAT2_ROOT" 2>/dev/null && find . -mindepth 1 "${PRUNE_EXPR[@]}" -type l -printf '%P\t%l\n' 2>>"$DENIED")
+    progress_done
     say "STALE into FAT1 (need repoint): $(wc -l < "$STALE")"; head -40 "$STALE" | sed 's/^/  /' | tee -a "$REPORT"
     say ""; say "BROKEN (target missing): $(wc -l < "$BROKEN")"; head -40 "$BROKEN" | sed 's/^/  /' | tee -a "$REPORT"
     say ""; say "SHARED — intentional (FAT1 link identical, KEEP): $(wc -l < "$SHARED_OK")"; head -40 "$SHARED_OK" | sed 's/^/  /' | tee -a "$REPORT"
@@ -424,7 +461,9 @@ do_fat2_audit() {
     hr "1. DIFFERENTIAL (FAT1 manifest vs FAT2, by relative path)"
     F1L="$REPORT_DIR/fat1.paths"; F2L="$REPORT_DIR/fat2.paths"
     cut -f1 "$MAN" | grep -v '^$' | LC_ALL=C sort > "$F1L"
-    ( cd "$FAT2_ROOT" 2>/dev/null && find . -mindepth 1 "${PRUNE_EXPR[@]}" -printf '%P\n' 2>>"$DENIED" | LC_ALL=C sort ) > "$F2L"
+    progress "FAT2 walking $FAT2_ROOT .."
+    ( cd "$FAT2_ROOT" 2>/dev/null && find . -mindepth 1 "${PRUNE_EXPR[@]}" -printf '%P\n' 2>>"$DENIED" | count_filter "FAT2 tree" | LC_ALL=C sort ) > "$F2L"
+    progress_done
     MISS="$REPORT_DIR/missing_in_fat2.txt"; EXTRA="$REPORT_DIR/extra_in_fat2.txt"
     comm -23 "$F1L" "$F2L" > "$MISS"; comm -13 "$F1L" "$F2L" > "$EXTRA"
     sub "Present in FAT1, MISSING in FAT2"
@@ -443,7 +482,9 @@ do_fat2_audit() {
     say "A REBUILD must stage them through /tmp via $FAT1_USER (selective_copy model)."
     F1VIS="$REPORT_DIR/fat1_visible_to_fat2.paths"
     GAP_UNREACH="$REPORT_DIR/gap_unreachable_subtrees.txt"; GAP_UNREAD="$REPORT_DIR/gap_unreadable_files.txt"
-    ( cd "$FAT1_ROOT" 2>/dev/null && find . -mindepth 1 "${PRUNE_EXPR[@]}" -printf '%P\n' 2>>"$DENIED" | LC_ALL=C sort ) > "$F1VIS"
+    progress "FAT1 reachability probe (as $(id -un)) .."
+    ( cd "$FAT1_ROOT" 2>/dev/null && find . -mindepth 1 "${PRUNE_EXPR[@]}" -printf '%P\n' 2>>"$DENIED" | count_filter "FAT1 reachability" | LC_ALL=C sort ) > "$F1VIS"
+    progress_done
     comm -23 "$F1L" "$F1VIS" > "$GAP_UNREACH"
     ( cd "$FAT1_ROOT" 2>/dev/null && find . -mindepth 1 "${PRUNE_EXPR[@]}" -type f ! -readable -printf '%P\n' 2>>"$DENIED" | LC_ALL=C sort ) > "$GAP_UNREAD"
     sub "Unreachable subtrees (in manifest, NOT visible to $(id -un) — untraversable dirs)"
@@ -461,9 +502,11 @@ do_fat2_audit() {
         local _tg=()
         if [ "$HAVE_MAP" = 1 ] && [ "${#TOKEN_GREP[@]}" -gt 0 ]; then _tg=("${TOKEN_GREP[@]}"); else _tg=( -e "$FAT1_TOKEN" ); fi
         hr "1. UNREWRITTEN — FAT2 plain-text still containing a FAT1 source token (SCOPE: ${SCOPE:-all})"
+        progress "FAT2 scanning text for leftover FAT1 tokens (reads all text).."
         if [ "${#SCOPE_ROOTS[@]}" -gt 0 ]; then
             grep -rIl "${GREP_EXCLUDES[@]+"${GREP_EXCLUDES[@]}"}" "${_tg[@]}" "${SCOPE_ROOTS[@]}" 2>>"$DENIED" > "$UNREW" || true
         fi
+        progress_done
         say "  count: $(wc -l < "$UNREW")"; sed "s|^$FAT2_ROOT/|  |" "$UNREW" | head -60 | tee -a "$REPORT"
 
         hr "0. TOMCAT INSTANCES & DECLARED PORTS (FAT2, SCOPE: ${SCOPE:-all})"
