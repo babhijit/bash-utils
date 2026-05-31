@@ -237,7 +237,7 @@ main() {
     # Fresh mock CSV.
     echo "Name,Absolute_Path,Last_Modified" > "$MOCK_CSV"
 
-    csv_read_3col "$CSV_FILE" process_row
+    CSV_PROGRESS_LABEL="building mock from CSV" csv_read_3col "$CSV_FILE" process_row
 
     info "----- SUMMARY -----"
     info "  copied:  $COUNT_COPIED"

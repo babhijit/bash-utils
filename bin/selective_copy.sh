@@ -356,8 +356,10 @@ attrs_record() {
     # (symlink target) is empty for every non-symlink, so it MUST be the LAST
     # -printf field — a trailing empty is simply trimmed, leaving rel intact.
     # (Putting %l mid-list skipped every regular file; caught by phased_copy_test.)
+    local _ra=0
     while IFS=$'\t' read -r type mode mtime owner group rel link; do
         [ -z "$rel" ] && continue
+        _ra=$((_ra + 1)); tick "$_ra" "recording attributes: $_ra"
         printf '%s,%s,%s,%s,%s,%s,%s\n' \
             "$(csv_quote_field "$rel")" \
             "$(csv_quote_field "$type")" \
@@ -367,6 +369,7 @@ attrs_record() {
             "$(csv_quote_field "$group")" \
             "$(csv_quote_field "$link")" >> "$out"
     done < <(find "$root" -mindepth 1 -printf '%y\t%m\t%T@\t%u\t%g\t%P\t%l\n')
+    progress_done
 }
 
 # attrs_restore <csv> <target_root>
@@ -397,7 +400,9 @@ attrs_restore() {
     ' "$csv" > "$parsed"
 
     local rel type mode mtime owner group link final restored=0
+    local _rs=0
     while IFS=$'\t' read -r rel type mode mtime owner group link; do
+        _rs=$((_rs + 1)); tick "$_rs" "restoring attributes: $_rs"
         rel="$(csv_strip_field "$rel")"
         type="$(csv_strip_field "$type")"
         mode="$(csv_strip_field "$mode")"
@@ -418,6 +423,7 @@ attrs_restore() {
         fi
         restored=$((restored + 1))
     done < "$parsed"
+    progress_done
     rm -f "$parsed"
     info "Restored attributes for $restored file(s)/symlink(s)."
     emit_event "$EVENTS_LOG" "event=attrs_restored" "count=$restored"
@@ -535,13 +541,16 @@ run_plan() {
 
         # Directory tree: enumerate files, symlinks, empty dirs (rel to item_root).
         local rel size
+        local _pe=0
         while IFS=$'\t' read -r size rel; do
             [ -z "$rel" ] && continue
+            _pe=$((_pe + 1)); tick "$_pe" "planning '$src_name': $_pe items"
             matches_exclude "$src_name" "$rel" && continue
             add_entry T "$src_name" "$dest_name" "$rel" "$size"
         done < <(find "$item_root" -mindepth 1 \( -type f -printf '%s\t%P\n' \) -o \
                                    \( -type l -printf '0\t%P\n' \) -o \
                                    \( -type d -empty -printf '0\t%P\n' \) )
+        progress_done
 
         # Record EVERY directory's mode+mtime for the finalize reconcile, mapped
         # to the dest layout (dest_name + path-below-item). Deepest-first.
@@ -719,8 +728,10 @@ stage_batch_groups() {
         return 0
     }
 
+    local _st=0
     while IFS=$'\t' read -r kind src dest rel; do
         [ -z "$kind" ] && continue
+        _st=$((_st + 1)); tick "$_st" "staging batch entries: $_st"
         if [ "$kind" = "F" ]; then
             # Single file/symlink item: direct rsync WITH rename (--files-from
             # cannot rename). Close any open tree group first.
@@ -740,6 +751,7 @@ stage_batch_groups() {
         fi
         printf '%s\n' "$rel" >> "$tmp_list"
     done < "$manifest"
+    progress_done
     flush_group
     return "$rc"
 }

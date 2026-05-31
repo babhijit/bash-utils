@@ -39,6 +39,17 @@
 
 set -euo pipefail
 
+# --- Liveness heartbeat (standalone copy; mirrors common.sh) -------------------
+# This script does not source common.sh, so it carries its own minimal heartbeat:
+# a single rewriting line to the TERMINAL only ([ -t 2 ]) so a long dir-walk does
+# not look hung. No-op under redirect/pipe/cron; never to stdout. PROGRESS_EVERY=0
+# disables. (Canonical version lives in bin/common.sh.)
+_PROGRESS_TTY="$([ -t 2 ] && echo 1 || true)"
+PROGRESS_EVERY="${PROGRESS_EVERY:-200}"
+progress()      { { [ -n "$_PROGRESS_TTY" ] && [ "$PROGRESS_EVERY" != 0 ]; } && printf '\r  .. %-72s' "$*" >&2 || true; }
+progress_done() { [ -n "$_PROGRESS_TTY" ] && printf '\r%-78s\r' '' >&2 || true; }
+tick()          { [ "$PROGRESS_EVERY" = 0 ] && return 0; [ $(( $1 % PROGRESS_EVERY )) -eq 0 ] && progress "$2"; return 0; }
+
 ROOT=""
 CUTOFF=""
 DRY_RUN=0
@@ -188,7 +199,9 @@ skipped_empty=0
 skipped_correct=0
 errors=0
 
+_dm=0
 while IFS= read -r -d '' dir; do
+    _dm=$((_dm + 1)); tick "$_dm" "reconciling dir mtimes: $_dm"
     # Current mtime of the directory.
     if ! cur=$(stat -c '%Y' "$dir" 2>/dev/null); then
         echo "  ERROR    cannot stat: $dir" >&2
@@ -239,6 +252,7 @@ while IFS= read -r -d '' dir; do
         fi
     fi
 done < "$sorted"
+progress_done
 
 # --- Summary ----------------------------------------------------------------
 

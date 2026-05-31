@@ -426,7 +426,9 @@ migrate_directory() {
     done < <(find "$new_path" -depth -mindepth 1 -print0)
 
     local base mapped target child_mtime
+    local _ie=0
     for entry in "${entries[@]}"; do
+        _ie=$((_ie + 1)); tick "$_ie" "migrating dir entries: $_ie"
         if [ -f "$entry" ] && [ ! -L "$entry" ]; then
             child_mtime=$(lstat_mtime_human "$entry")
             if ! replace_content_in_file "$entry" MIGRATION_MAP; then
@@ -446,6 +448,7 @@ migrate_directory() {
             fi
         fi
     done
+    progress_done
 }
 
 migrate_file() {
@@ -495,7 +498,7 @@ run_execute() {
     # dry-run (no backups are taken). +32 MiB headroom for tracking + overhead.
     if [ "$DRY_RUN" -ne 1 ]; then
         local _PREFLIGHT_BYTES=0
-        csv_read_3col "$CSV_FILE" preflight_sum_row
+        CSV_PROGRESS_LABEL="preflight sizing rows" csv_read_3col "$CSV_FILE" preflight_sum_row
         info "Estimated backup footprint: $(human_bytes "$_PREFLIGHT_BYTES") into $WORKDIR"
         check_free_space_bytes "$WORKDIR" "$(( _PREFLIGHT_BYTES + 33554432 ))"
     fi
@@ -505,7 +508,7 @@ run_execute() {
     # Reading CSV with a callback that mutates global state (process_row's
     # tracking appends, dry-run flags, etc.) — csv_read_3col is designed
     # to run the callback in this shell.
-    csv_read_3col "$CSV_FILE" process_row
+    CSV_PROGRESS_LABEL="migrating rows" csv_read_3col "$CSV_FILE" process_row
 
     success "EXECUTE finished. See tracking file: $TRACKING_FILE"
 }
@@ -586,7 +589,9 @@ run_rollback() {
     declare -A done_rollback
     local path
     local count=0
+    local _rb=0
     while IFS=, read -r orig _ _ _ _; do
+        _rb=$((_rb + 1)); tick "$_rb" "rolling back rows: $_rb"
         orig=$(csv_strip_field "$orig")
         [ -z "$orig" ] && continue
         [ -n "${done_rollback[$orig]:-}" ] && continue
@@ -633,6 +638,7 @@ run_rollback() {
                 ;;
         esac
     done < <(tac "$TRACKING_FILE" | grep -v '^Original_Path,')
+    progress_done
 
     success "ROLLBACK finished. Restored $count paths."
 

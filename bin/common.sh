@@ -100,6 +100,35 @@ die() {
 }
 
 # -----------------------------------------------------------------------------
+# Liveness heartbeat (TTY-only; never pollutes logs/reports/output)
+# -----------------------------------------------------------------------------
+#
+# Long find-walks and per-file loops on deep trees run silent for minutes and
+# look hung. These print a SINGLE rewriting line to the TERMINAL so the operator
+# sees it is alive. They emit ONLY when stderr is a TTY (a complete no-op under
+# redirect / pipe / cron, so log files and captured output stay clean) and ONLY
+# to stderr — never stdout, never LOG_FILE, never a report. Cost is a modulo test
+# per loop iteration — negligible vs the work it wraps. Tune via PROGRESS_EVERY
+# (default 200); set PROGRESS_EVERY=0 to disable entirely.
+#
+# Usage in a loop:   local _n=0
+#                    while ...; do _n=$((_n+1)); tick "$_n" "phase: $_n"; ...; done
+#                    progress_done
+# Usage on a NEWLINE-delimited walk:   find ... | count_filter "label" > file
+#   (NEVER insert count_filter into a NUL/-print0 pipeline — use tick in the loop.)
+_PROGRESS_TTY="$([ -t 2 ] && echo 1 || true)"
+PROGRESS_EVERY="${PROGRESS_EVERY:-200}"
+progress()      { { [ -n "$_PROGRESS_TTY" ] && [ "$PROGRESS_EVERY" != 0 ]; } && printf '\r  .. %-72s' "$*" >&2 || true; }
+progress_done() { [ -n "$_PROGRESS_TTY" ] && printf '\r%-78s\r' '' >&2 || true; }
+tick()          { [ "$PROGRESS_EVERY" = 0 ] && return 0; [ $(( $1 % PROGRESS_EVERY )) -eq 0 ] && progress "$2"; return 0; }
+count_filter() {
+    if [ -z "$_PROGRESS_TTY" ] || [ "$PROGRESS_EVERY" = 0 ]; then cat; return; fi
+    awk -v every="$PROGRESS_EVERY" -v lbl="$1" '
+        { print; n++; if (n % every == 0) printf "\r  .. %s: %d", lbl, n > "/dev/stderr" }
+        END { printf "\r%-78s\r", "" > "/dev/stderr" }'
+}
+
+# -----------------------------------------------------------------------------
 # CSV parsing
 # -----------------------------------------------------------------------------
 #
@@ -154,7 +183,9 @@ csv_read_3col() {
     ' "$csv_file" > "$parsed_file"
 
     local name path ts
+    local _row=0
     while IFS=$'\t' read -r name path ts; do
+        _row=$((_row + 1)); tick "$_row" "${CSV_PROGRESS_LABEL:-processing CSV rows}: $_row"
         name="$(csv_strip_field "$name")"
         path="$(csv_strip_field "$path")"
         ts="$(csv_strip_field "$ts")"
@@ -170,6 +201,7 @@ csv_read_3col() {
         fi
         "$callback" "$name" "$path" "$ts"
     done < "$parsed_file"
+    progress_done
     rm -f "$parsed_file"
 }
 

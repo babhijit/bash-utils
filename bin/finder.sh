@@ -255,11 +255,15 @@ search_by_name() {
     mapfile -t find_prune_args < <(build_prune_args)
 
     local pattern path
+    local _nm=0
     for pattern in "${NAME_SEARCH_PATTERNS[@]}"; do
+        progress "name search: '$pattern'"
         while IFS= read -r -d '' path; do
+            _nm=$((_nm + 1)); tick "$_nm" "name matches: $_nm"
             record_name_match "$(match_key_for "$path")" "$pattern"
         done < <(find -L "$SEARCH_DIR" "${find_prune_args[@]}" -o -iname "*$pattern*" -print0)
     done
+    progress_done
 
     info "Name search done"
 }
@@ -284,7 +288,9 @@ search_by_content() {
     done
 
     local path matches m m_lc key
+    local _cm=0
     while IFS= read -r -d '' path; do
+        _cm=$((_cm + 1)); tick "$_cm" "content scan: $_cm files"
         # -o: print each match on its own line. -I: skip binary. -i:
         # case-insensitive. -F: fixed strings. sort -u dedupes across
         # repeated occurrences in the same file.
@@ -305,6 +311,7 @@ search_by_content() {
             done
         done <<< "$matches"
     done < <(find -L "$SEARCH_DIR" "${find_prune_args[@]}" -o -type f "${find_file_exclude_args[@]}" -print0)
+    progress_done
 
     info "Content search done"
 }

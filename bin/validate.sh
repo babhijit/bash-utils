@@ -402,12 +402,15 @@ run_per_row_checks() {
 
     local total=0
     local path
+    local _vr=0
     for path in "${!latest_status[@]}"; do
+        _vr=$((_vr + 1)); tick "$_vr" "validating rows: $_vr"
         [ "${latest_status[$path]}" = "COMPLETED" ] || continue
         total=$((total + 1))
         check_row "$path" "${new_for[$path]}" \
             "${bkp_for[$path]}" "${ts_for[$path]}"
     done
+    progress_done
 
     out ""
     out "${C_BOLD}====== VALIDATION SUMMARY ======${C_RESET}"
@@ -440,6 +443,7 @@ run_tree_scan() {
     local keys=("${!MIGRATION_MAP[@]}")
 
     for pattern in "${keys[@]}"; do
+        progress "scanning tree for '${pattern}' (names + content).."
         local n_count c_count
         # Name hits
         n_count=$(find -L "$SCAN_ROOT" -iname "*${pattern}*" 2>/dev/null | wc -l)
@@ -463,6 +467,7 @@ run_tree_scan() {
         hits_name=$((hits_name + n_count))
         hits_content=$((hits_content + c_count))
     done
+    progress_done
 
     if [ "$hits_name" -eq 0 ] && [ "$hits_content" -eq 0 ]; then
         out "  ${C_GREEN}ZERO residual references${C_RESET}"
