@@ -42,10 +42,15 @@ Legend: [x] done · [ ] open · [~] in progress · [⏸] blocked/gated
       1. as opc_d1: `ROLE=fat1 FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 FAT1_USER=opc_d1 FAT2_USER=opc_d2 MANIFEST_DIR=/tmp/fat2_audit_handoff EXCLUDE_DIRS="_backup" bash bin/audit_env.sh`
       2. as opc_d2: `ROLE=fat2 ... MANIFEST_DIR=/tmp/fat2_audit_handoff REPORT_DIR=/tmp/fat2_audit EXCLUDE_DIRS="_backup" bash bin/audit_env.sh`
       (default run = `LEVEL=1` snapshot: scorecard + verdict + structural diff, no
-      content. Phase B: re-run both with `LEVEL=2 SCOPE="<flagged>"` to drill down.)
+      content. Phase B: re-run both with `LEVEL=2 SCOPE="<flagged>"` to drill down.
+      LEVEL-2 is REWRITE-AWARE: FAT2 judged vs the expected MIGRATION_MAP rewrite of
+      FAT1, NOT raw FAT1 → MIGRATED_OK / NOT_REWRITTEN / DRIFT; binaries IDENTICAL /
+      CORRUPT. **opc_d1 pass needs audit_env.sh + migration_map.sh; opc_d2 pass needs
+      only audit_env.sh.**)
 - [ ] Operator returns `/tmp/fat2_audit/` (audit.txt + breakdown incl. GAP lists).
 - [x] Two-user (opc_d1/opc_d2) handoff verified on bash 4.2.46: `tests/audit_two_user_test.sh`
-      43/43 (both LEVELs + SCOPE drill-down; manifest captures opc_d2-unreadable files;
+      49/49 (both LEVELs + SCOPE drill-down; rewrite verdicts MIGRATED_OK/NOT_REWRITTEN/
+      DRIFT + binary IDENTICAL/CORRUPT; manifest captures opc_d2-unreadable files;
       GAP set exact; EXCLUDE symmetric; LEVEL-1 skips content).
 - [ ] (Optional safety-first) rehearse the toolkit on a Linux box / `tests/docker` first.
 

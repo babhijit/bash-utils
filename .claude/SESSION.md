@@ -19,7 +19,7 @@ Current Focus: **FAT2 repair engagement, at the Phase 0 gate.** Read-only audit 
 
 ## What is on `main` (single branch — everything consolidated)
 
-- `bin/audit_env.sh` — read-only differential audit (Phase 0/1/2); masks secrets; RO on both trees.
+- `bin/audit_env.sh` — read-only differential audit (Phase 0/1/2); two-login manifest handoff × LEVEL 1/2 snapshot/drill-down; **rewrite-aware** (sources `migration_map.sh`, compares FAT2 to the expected rewrite, not raw FAT1); masks secrets; RO on both trees.
 - `bin/selective_copy.sh` — PHASED/batched cross-user copy under the ~1 GB `/tmp` cap (plan → prepare/deploy loop → finalize; marker-based no-sync; per-batch attribute-reference CSV; resume; free-space preflight; dual logging; live progress).
 - `bin/migrator.sh` — in-place fat1→fat2 rewrite + backup/resume/rollback + a new backup free-space preflight.
 - `bin/validate.sh`, `bin/finder.sh`, `bin/fix_dir_mtimes.sh`, `bin/mock_build.sh`; libs `common.sh`/`migration_map.sh`/`tracking.sh`/`backup.sh`.
@@ -47,9 +47,14 @@ Current Focus: **FAT2 repair engagement, at the Phase 0 gate.** Read-only audit 
    lists, a per-subsystem **scorecard**, and a heuristic **verdict**). This default
    run is `LEVEL=1` (fast snapshot — no hashing/content/cert). **Phase B:** re-run
    both passes with `LEVEL=2 SCOPE="<flagged subsystems>"` to drill into content +
-   checksums + cert decode where the verdict points. Verified on two real users
-   (bash 4.2.46): `tests/audit_two_user_test.sh` **43/43** (both levels + SCOPE +
-   exclude-symmetry + permission GAP) via the `bashutils7:audit` image.
+   certs where the verdict points. The LEVEL-2 compare is **rewrite-aware**: FAT2
+   is a string-rewritten copy, so it's judged against the *expected* `MIGRATION_MAP`
+   rewrite of FAT1 (MIGRATED_OK / NOT_REWRITTEN / DRIFT; binaries IDENTICAL /
+   CORRUPT), NOT against raw FAT1. **Deploy note:** the `opc_d1` pass needs
+   `bin/audit_env.sh` + `bin/migration_map.sh` together; the `opc_d2` pass needs
+   only `audit_env.sh`. Verified on two real users (bash 4.2.46):
+   `tests/audit_two_user_test.sh` **49/49** (both levels + SCOPE + exclude-symmetry
+   + permission GAP + rewrite verdicts) via the `bashutils7:audit` image.
 2. **PHASE 1/2:** Claude turns the report into differential tables, cert dispositions, and a **repair-vs-rebuild recommendation backed by the counts**.
 3. **PHASE 3:** present port-remap + path-remap + ownership model + per-cert disposition → get approval.
 4. **PHASE 4:** execute one subsystem at a time (FAT2 writes only), validate after each. If "rebuild", the parked phased pipeline is the mechanism.

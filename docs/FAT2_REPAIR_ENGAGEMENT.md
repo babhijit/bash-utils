@@ -58,7 +58,7 @@ This is the piece that is easy to lose. **This `bash-utils` repo *is* the family
 |---|---|
 | "bespoke bash utility scripts that copied/rewrote FAT1→FAT2 … buggy … the root cause" (Brief Q8 asks to locate them) | **= this repo**: `selective_copy.sh`, `migrator.sh`, `finder.sh`, `validate.sh`. They are **SUSPECT EVIDENCE**, not a tool to re-run blindly. |
 | What we did this session | **Audited + hardened** the toolkit — fixed bugs A–F, rewrote `selective_copy` as a **phased/batched** copy under the ~1 GB `/tmp` cap, added exhaustive bash-4.2.46 container tests. This makes the **rebuild option trustworthy *if chosen*; it does NOT license re-running them now.** |
-| Phase 0 Discovery + Phase 1 differential + Phase 2 cert deep-dive (all read-only) | **= `bin/audit_env.sh`** (on `main`). Read-only on both trees; three-way symlink classification; missing/extra/unrewritten/ownership diffs; Tomcat ports; Oracle config; cert/keystore inventory (OpenSSL 1.0.2-compatible). Masks secrets, captures permission-denied, refuses a `REPORT_DIR` under either tree. |
+| Phase 0 Discovery + Phase 1 differential + Phase 2 cert deep-dive (all read-only) | **= `bin/audit_env.sh`** (on `main`). Two-login manifest handoff (each user authoritative for its own tree) × two LEVELs (snapshot → drill-down); three-way symlink classification; missing/extra/ownership diffs; **rewrite-aware** content compare (FAT2 vs the *expected* `MIGRATION_MAP` rewrite of FAT1 → MIGRATED_OK / NOT_REWRITTEN / DRIFT; binaries IDENTICAL / CORRUPT); readability-GAP; Tomcat ports; Oracle config; cert/keystore inventory (OpenSSL 1.0.2-compatible). Masks secrets, captures permission-denied, refuses a `REPORT_DIR` under either tree. |
 | Phase 4 rebuild **mechanism** (only if chosen) | The hardened **`selective_copy` (phased) → `migrator` → `validate`** pipeline — **PARKED** until Phase 3 decides. |
 | Brief Q7 (shell access) | **INDIRECT** — Claude runs on macOS, not the host. Produces scripts; the operator runs them and returns stdout/stderr. |
 | Brief Q8 (location of the scripts) | **Answered: this repo.** Audited + hardened this session; treated as the suspect cause, not re-run blindly. |
@@ -123,10 +123,33 @@ several phases, so snapshot high-level first and drill down only where it matter
   Per-subsystem file+byte **scorecard** (FAT1 vs FAT2), path differential counts,
   symlink classification, ownership breakage, readability GAP, and a heuristic
   **divergence VERDICT** that names the drifting subsystems to drill into.
-- **`LEVEL=2` — DRILL-DOWN.** Adds unrewritten-token grep, binary checksum
-  compare, cert decode, Tomcat/Oracle config. `SCOPE="sub1 sub2"` limits the
-  expensive content work to named top-level subsystems (the structural diff stays
-  whole-tree). Pass the SAME `LEVEL`/`SCOPE` to BOTH passes.
+- **`LEVEL=2` — DRILL-DOWN.** Adds unrewritten-token grep, **rewrite-aware
+  content compare**, cert decode, Tomcat/Oracle config. `SCOPE="sub1 sub2"` limits
+  the expensive content work to named top-level subsystems (the structural diff
+  stays whole-tree). Pass the SAME `LEVEL`/`SCOPE` to BOTH passes.
+
+**Rewrite-awareness (critical):** FAT2 is **not** an exact copy of FAT1 — the
+migration string-rewrites it (`migration_map.sh`: `opc_d1→opc_d2`, `fat1→fat2`,
+`xbapp_d1→xbapp_d2`, `opcsvcf1→opcsvcf2`, `FAT1→FAT2`). So a correctly-migrated
+config file **must** differ from FAT1 — by exactly that map. The audit therefore
+does **not** compare FAT2 to the raw FAT1; it compares FAT2 to the **expected
+rewrite** of FAT1 (the fat1 pass applies the same map + `sed` semantics as
+[migrator.sh](../bin/migrator.sh)/[common.sh](../bin/common.sh) and records the
+expected hash). Each detected file lands in one of:
+
+| Verdict | Meaning |
+|---|---|
+| **MIGRATED_OK** | FAT2 == expected rewrite → correct (even though bytes differ from FAT1) |
+| **NOT_REWRITTEN** | FAT2 == raw FAT1, token still present → the rewrite never ran |
+| **DRIFT/PARTIAL** | FAT2 ≠ raw and ≠ expected → half-applied `sed` or a manual edit |
+| **IDENTICAL** (binary) | jars/keystores/certs are never rewritten → must stay byte-identical |
+| **CORRUPT(bin)** | a binary that differs → corruption suspect (text-mode `sed` damage, bad copy) |
+
+Because the audit reads the **same `MIGRATION_MAP`** as migrator/finder/validate,
+"what finder detects = what migrator rewrites = what the audit judges" holds by
+construction. Consequence for deployment: the **fat1 (`opc_d1`) pass needs BOTH
+`bin/audit_env.sh` and `bin/migration_map.sh`** beside each other; the fat2
+(`opc_d2`) pass needs only `audit_env.sh` (it compares recorded hashes).
 
 **Phase A — snapshot** (adjust `EXCLUDE_DIRS` to the real backup dir names):
 ```
@@ -164,7 +187,10 @@ exclude-symmetry + the permission GAP).
 - FAT2 symlinks **into FAT1** and **broken** symlinks
 - FAT2 plain-text files **still containing `opc_d1` / `/applications/opc_d1`** (and
   FAT1 hostname if it has a `d1`-style suffix) — incomplete rewrite
-- files in both that **differ** (many *should* — is the difference *correct*?)
+- files in both that **differ** — judged against the **expected rewrite**, not the
+  raw original (MIGRATED_OK / NOT_REWRITTEN / DRIFT for text; IDENTICAL / CORRUPT
+  for binaries). "differs" alone is not a defect; "differs from the expected
+  rewrite" is.
 - FAT1 files `opc_d2` **cannot read** (shared-read feasibility)
 - FAT2 entries **not owned by `opc_d2`** (ownership breakage)
 
@@ -245,7 +271,7 @@ Idempotent, logged, backup-before-edit scripts. (If "rebuild": the parked phased
 
 | Script | Role in this engagement |
 |--------|--------------------------|
-| `bin/audit_env.sh` | **Phase 0/1/2 read-only audit.** The tool that runs first. |
+| `bin/audit_env.sh` | **Phase 0/1/2 read-only audit.** The tool that runs first. Rewrite-aware (sources `migration_map.sh` on the fat1 pass to compare FAT2 against the *expected* rewrite, not raw FAT1). |
 | `bin/selective_copy.sh` | **Phased/batched cross-user copy** (FAT1→/tmp→FAT2 under the ~1 GB cap). The rebuild mechanism — **parked** until Phase 3. |
 | `bin/migrator.sh` | In-place `fat1→fat2` path/content rewrite with backup/resume/rollback + free-space preflight. Rebuild step 2. |
 | `bin/validate.sh` | Post-migration consistency checker. Rebuild validation. |
@@ -287,8 +313,10 @@ ROLE=fat2 FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
   FAT1_USER=opc_d1 FAT2_USER=opc_d2 MANIFEST_DIR=/tmp/fat2_audit_handoff \
   REPORT_DIR=/tmp/fat2_audit EXCLUDE_DIRS="_backup" bash bin/audit_env.sh
 ```
-then returns `/tmp/fat2_audit/` (and `/tmp/fat2_audit_handoff/`). Only one file
-needs deploying: `bin/audit_env.sh` (self-contained, sources nothing). Claude
-produces the Phase 1/2 differential tables, cert dispositions, and the
+then returns `/tmp/fat2_audit/` (and `/tmp/fat2_audit_handoff/`). Deploy
+`bin/audit_env.sh` **plus `bin/migration_map.sh`** for the `opc_d1` pass (it
+applies the map to compute the expected rewrite); the `opc_d2` pass needs only
+`audit_env.sh`. Claude produces the Phase 1/2 differential tables (incl. the
+MIGRATED_OK / NOT_REWRITTEN / DRIFT breakdown), cert dispositions, and the
 repair-vs-rebuild recommendation. **No FAT2 writes until a Phase 3 plan is
 approved.**

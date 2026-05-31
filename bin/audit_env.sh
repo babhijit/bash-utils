@@ -145,6 +145,46 @@ for _s in $SCOPE; do [ -n "$_s" ] && _SCOPE_SET["$_s"]=1; done
 # in_scope <relpath> -> true if SCOPE empty (all) or rel's top segment is named.
 in_scope(){ [ -z "$SCOPE" ] && return 0; local seg="${1%%/*}"; [ -n "${_SCOPE_SET[$seg]:-}" ]; }
 
+# --- Migration map (authoritative; shared with migrator/finder/validate) ------
+# FAT2 is a STRING-REWRITTEN copy of FAT1 (see migration_map.sh + common.sh
+# replace_content_in_file), so a correctly-migrated config SHOULD differ from
+# FAT1 by exactly this map. Sourced as passive DATA so the fat1 LEVEL=2 pass can
+# compute each file's EXPECTED REWRITE and compare FAT2 against THAT, not the raw
+# original. Only the fat1 pass needs it; if absent (fat2-only deploy, or LEVEL 1)
+# we degrade gracefully to raw-hash compare.
+_MAP_FILE="$(dirname "${BASH_SOURCE[0]}")/migration_map.sh"
+HAVE_MAP=0
+if [ -f "$_MAP_FILE" ]; then
+    # shellcheck source=/dev/null
+    source "$_MAP_FILE" && HAVE_MAP=1
+fi
+
+# sed-safe literal escapes — mirror common.sh so the audit's rewrite is byte-for
+# -byte what migrator.sh produced (same map, same sed semantics).
+_sed_esc_lit(){ local s="$1"; s="${s//\\/\\\\}"; s="${s//./\\.}"; s="${s//\*/\\*}"; s="${s//\[/\\[}"; s="${s//^/\\^}"; s="${s//\$/\\$}"; s="${s//|/\\|}"; s="${s//\//\\/}"; printf '%s' "$s"; }
+_sed_esc_rep(){ local s="$1"; s="${s//\\/\\\\}"; s="${s//&/\\&}"; s="${s//|/\\|}"; printf '%s' "$s"; }
+
+# Build the rewrite sed program + the source-token grep args from the map keys.
+REWRITE_SED=(); TOKEN_GREP=()
+if [ "$HAVE_MAP" = 1 ]; then
+    for _k in "${!MIGRATION_MAP[@]}"; do
+        REWRITE_SED+=( -e "s|$(_sed_esc_lit "$_k")|$(_sed_esc_rep "${MIGRATION_MAP[$_k]}")|g" )
+        TOKEN_GREP+=( -e "$_k" )
+    done
+fi
+# is_text: mirror `grep -I` — the migrator never sed-rewrites binaries.
+is_text(){ grep -Iq . "$1" 2>/dev/null; }
+# expected_hash <file>: sha256 of <file> AFTER the migration rewrite (text) or of
+# the raw bytes (binary / no map). A CORRECTLY migrated FAT2 copy must hash to this.
+expected_hash(){
+    local f="$1"
+    if [ "$HAVE_MAP" = 1 ] && [ "${#REWRITE_SED[@]}" -gt 0 ] && is_text "$f"; then
+        sed "${REWRITE_SED[@]}" "$f" 2>/dev/null | sha256sum | awk '{print $1}'
+    else
+        sha256sum "$f" 2>/dev/null | awk '{print $1}'
+    fi
+}
+
 # --- Output helpers (REPORT is set per role before any say/hr/sub call) -------
 REPORT="/dev/null"
 DENIED="/dev/null"
@@ -204,14 +244,34 @@ do_fat1_manifest() {
         find . -mindepth 1 "${PRUNE_EXPR[@]}" -printf '%P\t%y\t%s\t%m\t%u:%g\t%l\n' 2>>"$DEN" ) > "$MAN"
 
     if [ "$LEVEL" = 2 ]; then
-        # 2) Hashes for the binary/cert compare set (SCOPE-limited).
+        # 2) Hashes for the compare set. Two kinds, 4-col manifest:
+        #      raw_hash <TAB> expected_hash <TAB> kind <TAB> relpath
+        #    - kind=rewrite: FAT1 text files that CONTAIN a source token (exactly
+        #      what finder detects == what SHOULD be rewritten). expected = hash of
+        #      the migration-rewritten content. fat2 checks FAT2 == expected.
+        #    - kind=binary: keystores/jars/certs (never rewritten). expected = raw;
+        #      a FAT2 mismatch means corruption, not migration.
+        local -A _seen
+        if [ "$HAVE_MAP" = 1 ] && [ "${#TOKEN_GREP[@]}" -gt 0 ]; then
+            while IFS= read -r f; do
+                [ -z "$f" ] && continue
+                local rel="${f#$FAT1_ROOT/}"
+                in_scope "$rel" || continue
+                [ -f "$f" ] || continue
+                local raw exp
+                raw="$(sha256sum "$f" 2>>"$DEN" | awk '{print $1}')"
+                exp="$(expected_hash "$f")"
+                [ -n "$raw" ] && { printf '%s\t%s\trewrite\t%s\n' "$raw" "$exp" "$rel" >> "$HASHF"; _seen["$rel"]=1; }
+            done < <( grep -rIl "${GREP_EXCLUDES[@]+"${GREP_EXCLUDES[@]}"}" "${TOKEN_GREP[@]}" "$FAT1_ROOT" 2>>"$DEN" )
+        fi
         while IFS= read -r rel; do
             [ -z "$rel" ] && continue
             in_scope "$rel" || continue
+            [ -n "${_seen[$rel]:-}" ] && continue
             local f="$FAT1_ROOT/$rel"
             [ -f "$f" ] || continue
             local h; h="$(sha256sum "$f" 2>>"$DEN" | awk '{print $1}')"
-            [ -n "$h" ] && printf '%s\t%s\n' "$h" "$rel" >> "$HASHF"
+            [ -n "$h" ] && printf '%s\t%s\tbinary\t%s\n' "$h" "$h" "$rel" >> "$HASHF"
         done < <( cd "$FAT1_ROOT" 2>/dev/null && \
             find . -mindepth 1 "${PRUNE_EXPR[@]}" -type f "${binary_compare_find_args[@]}" -printf '%P\n' 2>>"$DEN" )
 
@@ -264,14 +324,15 @@ do_fat2_audit() {
     DENIED="$REPORT_DIR/permission_denied.txt"; : > "$REPORT"; : > "$DENIED"
 
     # ----- Ingest the FAT1 manifest into lookup maps -------------------------
-    declare -A F1LINK F1HASH
+    declare -A F1LINK F1RAW F1EXP F1KIND
     while IFS=$'\t' read -r rel typ size mode owner tgt; do
         [ -z "$rel" ] && continue
         [ "$typ" = "l" ] && F1LINK["$rel"]="$tgt"
     done < "$MAN"
-    while IFS=$'\t' read -r h rel; do
+    # 4-col hashes: raw_hash <TAB> expected_hash <TAB> kind <TAB> relpath
+    while IFS=$'\t' read -r raw exp kind rel; do
         [ -z "$rel" ] && continue
-        F1HASH["$rel"]="$h"
+        F1RAW["$rel"]="$raw"; F1EXP["$rel"]="$exp"; F1KIND["$rel"]="$kind"
     done < "$HASHF"
 
     # ----- FAT2 search roots for SCOPE-limited LEVEL 2 content ops -----------
@@ -392,11 +453,16 @@ do_fat2_audit() {
 
     # ============================ LEVEL 2 ONLY ===================================
     UNREW="$REPORT_DIR/unrewritten.txt"; : > "$UNREW"
-    NDIFF=0; NIDENT=0; NABSENT=0
+    NMIG=0; NNOT=0; NDRIFT=0; NBOK=0; NBAD=0
     if [ "$LEVEL" = 2 ]; then
-        hr "1. UNREWRITTEN — FAT2 plain-text still containing '$FAT1_TOKEN' (SCOPE: ${SCOPE:-all})"
+        # Source-token grep uses ALL map keys when the map is present (a file may
+        # carry fat1/FAT1/xbapp_d1/opcsvcf1, not just opc_d1); else fall back to
+        # the single FAT1_TOKEN.
+        local _tg=()
+        if [ "$HAVE_MAP" = 1 ] && [ "${#TOKEN_GREP[@]}" -gt 0 ]; then _tg=("${TOKEN_GREP[@]}"); else _tg=( -e "$FAT1_TOKEN" ); fi
+        hr "1. UNREWRITTEN — FAT2 plain-text still containing a FAT1 source token (SCOPE: ${SCOPE:-all})"
         if [ "${#SCOPE_ROOTS[@]}" -gt 0 ]; then
-            grep -rIl "${GREP_EXCLUDES[@]+"${GREP_EXCLUDES[@]}"}" -- "$FAT1_TOKEN" "${SCOPE_ROOTS[@]}" 2>>"$DENIED" > "$UNREW" || true
+            grep -rIl "${GREP_EXCLUDES[@]+"${GREP_EXCLUDES[@]}"}" "${_tg[@]}" "${SCOPE_ROOTS[@]}" 2>>"$DENIED" > "$UNREW" || true
         fi
         say "  count: $(wc -l < "$UNREW")"; sed "s|^$FAT2_ROOT/|  |" "$UNREW" | head -60 | tee -a "$REPORT"
 
@@ -450,20 +516,30 @@ do_fat2_audit() {
         if [ -s "$CERTF" ]; then cat "$CERTF" | tee -a "$REPORT"; else say "  (none / fat1 cert file empty — was ROLE=fat1 run at LEVEL=2?)"; fi
         sub "JKS/P12/keystores — alias & validity DEFERRED (needs store password, Phase 2b)"
 
-        sub "Binary checksum compare FAT2 vs FAT1 manifest (SCOPE: ${SCOPE:-all})"
+        sub "REWRITE-AWARE compare: FAT2 vs the EXPECTED migration of FAT1 (SCOPE: ${SCOPE:-all})"
+        say "  FAT2 is a string-rewritten copy, so 'differs from FAT1' is EXPECTED."
+        say "  Each detected file is judged against the rewrite the migration SHOULD"
+        say "  have produced (migration_map.sh). Binaries must stay byte-identical."
         if [ "$(wc -l < "$HASHF")" -eq 0 ]; then
-            say "  WARN: FAT1 hash manifest is EMPTY — re-run ROLE=fat1 at LEVEL=2${SCOPE:+ SCOPE=\"$SCOPE\"}."
+            say "  WARN: FAT1 hash manifest is EMPTY — re-run ROLE=fat1 at LEVEL=2${SCOPE:+ SCOPE=\"$SCOPE\"}"
+            say "        (and ensure migration_map.sh sits beside audit_env.sh for the fat1 pass)."
         fi
+        [ "$HAVE_MAP" = 1 ] || say "  NOTE: migration_map.sh not loaded here — 'rewrite' verdicts rely on the fat1 pass's map."
         while IFS= read -r rel; do
             [ -z "$rel" ] && continue
-            in_scope "$rel" || continue
-            local f2="$FAT2_ROOT/$rel"; [ -f "$f2" ] || continue
+            local f2="$FAT2_ROOT/$rel"
+            [ -e "$f2" ] || continue   # absent => already in missing_in_fat2
             local h2; h2="$(sha256sum "$f2" 2>>"$DENIED" | awk '{print $1}')"
-            local h1="${F1HASH[$rel]:-}"
-            if   [ -z "$h1" ]; then say "  FAT1-ABSENT $rel"; NABSENT=$((NABSENT + 1))
-            elif [ "$h1" = "$h2" ]; then say "  IDENTICAL   $rel"; NIDENT=$((NIDENT + 1))
-            else say "  DIFFERS     $rel   (FAT1 $h1 / FAT2 $h2)"; NDIFF=$((NDIFF + 1)); fi
-        done < <( cd "$FAT2_ROOT" 2>/dev/null && find . -mindepth 1 "${PRUNE_EXPR[@]}" -type f \( -name '*.jks' -o -name '*.p12' -o -name '*.keystore' -o -name '*.truststore' -o -name '*.jar' \) -printf '%P\n' 2>>"$DENIED" )
+            local raw="${F1RAW[$rel]:-}" exp="${F1EXP[$rel]:-}" kind="${F1KIND[$rel]:-}"
+            if [ "$kind" = "binary" ]; then
+                if [ "$h2" = "$raw" ]; then say "  IDENTICAL      $rel"; NBOK=$((NBOK + 1))
+                else say "  CORRUPT(bin)   $rel   (binary changed — never rewritten; suspect)"; NBAD=$((NBAD + 1)); fi
+            else
+                if   [ "$h2" = "$exp" ]; then say "  MIGRATED_OK    $rel"; NMIG=$((NMIG + 1))
+                elif [ "$h2" = "$raw" ]; then say "  NOT_REWRITTEN  $rel   (still the raw FAT1 content)"; NNOT=$((NNOT + 1))
+                else say "  DRIFT/PARTIAL  $rel   (neither raw nor the expected rewrite)"; NDRIFT=$((NDRIFT + 1)); fi
+            fi
+        done < <( for r in "${!F1RAW[@]}"; do printf '%s\n' "$r"; done | LC_ALL=C sort )
 
         hr "0. SCHEDULED / STARTUP"
         sub "crontab for $(id -un) (redacted)"
@@ -503,10 +579,11 @@ do_fat2_audit() {
     say "  GAP: FAT1 unreachable subtrees      : $(wc -l < "$GAP_UNREACH")"
     say "  GAP: FAT1 unreadable files          : $(wc -l < "$GAP_UNREAD")"
     if [ "$LEVEL" = 2 ]; then
-        say "  Unrewritten (still has $FAT1_TOKEN)   : $(wc -l < "$UNREW")"
-        say "  Checksum DIFFERS / IDENTICAL / ABSENT: $NDIFF / $NIDENT / $NABSENT"
+        say "  Unrewritten (still has a FAT1 token): $(wc -l < "$UNREW")"
+        say "  Text  MIGRATED_OK / NOT_REWRITTEN / DRIFT : $NMIG / $NNOT / $NDRIFT"
+        say "  Binary IDENTICAL / CORRUPT          : $NBOK / $NBAD"
     else
-        say "  Unrewritten / checksum / certs      : n/a (LEVEL 1 snapshot — run LEVEL 2 to drill down)"
+        say "  Rewrite-compare / certs             : n/a (LEVEL 1 snapshot — run LEVEL 2 to drill down)"
     fi
     say "  Permission-denied lines             : $(wc -l < "$DENIED")"
     say ""

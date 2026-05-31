@@ -54,8 +54,10 @@ getent group  fatshare >/dev/null 2>&1 || groupadd fatshare
 getent passwd opc_d1   >/dev/null 2>&1 || useradd -m -G fatshare opc_d1
 getent passwd opc_d2   >/dev/null 2>&1 || useradd -m -G fatshare opc_d2
 
-# --- world-readable copy of the script ---------------------------------------
-mkdir -p "$BIN"; cp /repo/bin/audit_env.sh "$BIN/"; chmod -R a+rX "$BIN"
+# --- world-readable copy of the script + its sourced data module --------------
+# audit_env.sh sources migration_map.sh (the authoritative rewrite map) for the
+# fat1 LEVEL=2 expected-rewrite hashing, so both files must sit together.
+mkdir -p "$BIN"; cp /repo/bin/audit_env.sh /repo/bin/migration_map.sh "$BIN/"; chmod -R a+rX "$BIN"
 
 # openssl CLI is needed to exercise the cert-decode path. The bashutils7:audit
 # image bakes it in; on a vanilla centos:7 it is absent (only libssl ships), so
@@ -78,9 +80,17 @@ echo '<Server port="8005" shutdown="SHUTDOWN"><Connector port="8080"/></Server>'
 echo 'OPCDB=(DESCRIPTION=(ADDRESS=(HOST=db1)))' > "$F1/conf/tnsnames.ora"
 echo 'WALLET_LOCATION=/applications/opc_d1/security/wallet' > "$F1/conf/sqlnet.ora"
 
-# binaries: app.jar (will be MISSING in FAT2), common.jar (IDENTICAL in FAT2)
-printf 'APPJAR-FAT1-CONTENT' > "$F1/lib/app.jar"
-printf 'COMMON-JAR-SHARED'   > "$F1/lib/common.jar"
+# REWRITE-AWARE fixtures: three FAT1 configs that all carry the opc_d1 token, so
+# the migration SHOULD rewrite each to opc_d2. FAT2 will copy them in three
+# different states to exercise MIGRATED_OK / NOT_REWRITTEN / DRIFT.
+echo 'server=opc_d1.internal' > "$F1/conf/migrated_ok.properties"
+echo 'server=opc_d1.internal' > "$F1/conf/not_rewritten.properties"
+echo 'server=opc_d1.internal' > "$F1/conf/drifted.properties"
+
+# binaries (NUL => grep -I skips them => binary-integrity set, not rewrite):
+# app.jar will be MISSING in FAT2; common.jar IDENTICAL in FAT2.
+printf 'JAR\x00APP-ALPHA'  > "$F1/lib/app.jar"
+printf 'JAR\x00COMMON-XYZ' > "$F1/lib/common.jar"
 
 # a real cert (proves decode path) + a keystore that will DIFFER in FAT2
 if [ "$HAVE_OPENSSL" = 1 ]; then
@@ -88,7 +98,7 @@ if [ "$HAVE_OPENSSL" = 1 ]; then
         -out "$F1/security/server.pem" -days 365 -subj '/CN=fat1.example.com' >/dev/null 2>&1
     rm -f /tmp/k.tmp
 fi
-printf 'KEYSTORE-BYTES-FAT1' > "$F1/security/keystore.jks"
+printf 'JKS\x00\x01\x02\x03ALPHA' > "$F1/security/keystore.jks"   # binary (NUL) + token-free
 
 # STALE-symlink fixture: the FAT2 'logs' link points at this REAL FAT1 dir, so it
 # resolves INTO FAT1 (stale) rather than dangling (broken). Same relpath in both
@@ -127,14 +137,18 @@ echo 'export CATALINA_BASE=/applications/opc_d1' > "$F2/bin/setenv.sh"
 echo '<Server port="9005" shutdown="SHUTDOWN"><Connector port="9080"/></Server>' > "$F2/conf/server.xml"
 echo 'OPCDB=(DESCRIPTION=(ADDRESS=(HOST=db2)))' > "$F2/conf/tnsnames.ora"
 echo 'WALLET_LOCATION=/applications/opc_d2/security/wallet' > "$F2/conf/sqlnet.ora"
+# REWRITE-AWARE fixtures (FAT2 side), one per outcome:
+echo 'server=opc_d2.internal'             > "$F2/conf/migrated_ok.properties"   # == expected rewrite -> MIGRATED_OK
+echo 'server=opc_d1.internal'             > "$F2/conf/not_rewritten.properties" # == raw FAT1 (token left) -> NOT_REWRITTEN
+echo 'server=opc_d2.internal extra=hand'  > "$F2/conf/drifted.properties"       # rewritten + manual edit -> DRIFT
 # EXTRA (in FAT2, not FAT1)
 echo 'fat2 only' > "$F2/conf/extra_fat2_only.conf"
 # lib: common.jar IDENTICAL; app.jar deliberately ABSENT (=> MISSING)
-printf 'COMMON-JAR-SHARED' > "$F2/lib/common.jar"
+printf 'JAR\x00COMMON-XYZ' > "$F2/lib/common.jar"
 # security: keystore DIFFERS; server.pem copied; secret.key + private present
 #           as opc_d2-OWNED readable copies (so they are NOT missing; the GAP is
 #           strictly about reading the FAT1 side).
-printf 'KEYSTORE-BYTES-FAT2-DIFFERENT' > "$F2/security/keystore.jks"
+printf 'JKS\x00\x01\x02\x03BETA' > "$F2/security/keystore.jks"   # binary, differs => CORRUPT
 [ "$HAVE_OPENSSL" = 1 ] && cp "$F1/security/server.pem" "$F2/security/server.pem"
 echo 'fat2 own secret' > "$F2/security/secret.key"
 echo 'fat2 own hidden' > "$F2/security/private/hidden.txt"
@@ -183,8 +197,9 @@ echo "[differential]"
 assert_count "$RPT/missing_in_fat2.txt" 1 "missing_in_fat2 = {lib/app.jar}"
 assert_grep  "$RPT/missing_in_fat2.txt" 'lib/app\.jar' "  -> it is app.jar"
 assert_count "$RPT/extra_in_fat2.txt"   2 "extra_in_fat2 = {extra_fat2_only.conf, data}"
-assert_count "$RPT/unrewritten.txt"     1 "unrewritten = {bin/setenv.sh} (conf rewritten, _backup excluded)"
-assert_grep  "$RPT/unrewritten.txt"     'setenv\.sh' "  -> it is setenv.sh"
+assert_count "$RPT/unrewritten.txt"     2 "unrewritten = {bin/setenv.sh, conf/not_rewritten.properties}"
+assert_grep  "$RPT/unrewritten.txt"     'setenv\.sh'                "  -> setenv.sh still has token"
+assert_grep  "$RPT/unrewritten.txt"     'not_rewritten\.properties' "  -> not_rewritten.properties still has token"
 
 echo "[symlinks]"
 assert_count "$RPT/symlinks_stale_into_fat1.txt"    1 "stale-into-FAT1 = {logs}"
@@ -198,9 +213,14 @@ assert_grep  "$RPT/gap_unreadable_files.txt" 'security/secret\.key' "  -> it is 
 assert_count "$RPT/gap_unreachable_subtrees.txt"    1 "GAP unreachable = {security/private/hidden.txt}"
 assert_grep  "$RPT/gap_unreachable_subtrees.txt" 'security/private/hidden\.txt' "  -> it is private/hidden.txt"
 
-echo "[binary checksum compare]"
-assert_grep "$RPT/audit.txt" 'DIFFERS +security/keystore\.jks'  "keystore.jks DIFFERS FAT1 vs FAT2"
-assert_grep "$RPT/audit.txt" 'IDENTICAL +lib/common\.jar'       "common.jar IDENTICAL FAT1 vs FAT2"
+echo "[rewrite-aware compare: text]"
+assert_grep "$RPT/audit.txt" 'MIGRATED_OK +conf/migrated_ok\.properties'    "config rewritten correctly -> MIGRATED_OK"
+assert_grep "$RPT/audit.txt" 'NOT_REWRITTEN +conf/not_rewritten\.properties' "config left raw -> NOT_REWRITTEN"
+assert_grep "$RPT/audit.txt" 'DRIFT/PARTIAL +conf/drifted\.properties'      "config hand-edited -> DRIFT/PARTIAL"
+assert_grep "$RPT/audit.txt" 'MIGRATED_OK +conf/sqlnet\.ora'                "wallet path rewritten correctly -> MIGRATED_OK"
+echo "[rewrite-aware compare: binary]"
+assert_grep "$RPT/audit.txt" 'CORRUPT\(bin\) +security/keystore\.jks'       "keystore differs (binary, never rewritten) -> CORRUPT"
+assert_grep "$RPT/audit.txt" 'IDENTICAL +lib/common\.jar'                   "common.jar byte-identical -> IDENTICAL"
 
 echo "[scorecard + verdict present]"
 assert_grep "$RPT/audit.txt" 'SUBSYSTEM SCORECARD'   "subsystem scorecard rendered"
@@ -224,10 +244,10 @@ assert_count "$RPT_L1/gap_unreadable_files.txt"      1 "L1 GAP unreadable = 1"
 assert_grep  "$RPT_L1/audit.txt" 'SUBSYSTEM SCORECARD' "L1 renders the scorecard"
 assert_grep  "$RPT_L1/audit.txt" 'VERDICT'             "L1 renders the verdict"
 echo "[content SKIPPED at LEVEL 1]"
-assert_count   "$RPT_L1/unrewritten.txt" 0            "L1 does NOT content-grep (unrewritten empty)"
-assert_no_grep "$RPT_L1/audit.txt" 'DIFFERS '         "L1 does NOT checksum-compare"
-assert_no_grep "$RPT_L1/audit.txt" 'IDENTICAL '       "L1 does NOT checksum-compare (no IDENTICAL)"
-assert_grep    "$RPT_L1/audit.txt" 'n/a \(LEVEL 1'    "L1 summary marks content n/a"
+assert_count   "$RPT_L1/unrewritten.txt" 0              "L1 does NOT content-grep (unrewritten empty)"
+assert_no_grep "$RPT_L1/audit.txt" 'REWRITE-AWARE'      "L1 does NOT run the rewrite-aware compare"
+assert_no_grep "$RPT_L1/audit.txt" 'MIGRATED_OK'        "L1 emits no rewrite verdicts"
+assert_grep    "$RPT_L1/audit.txt" 'n/a \(LEVEL 1'      "L1 summary marks content n/a"
 if [ ! -s "$HANDOFF/fat1_hashes.tsv" ]; then pass "L1 manifest computes NO hashes (fast)"; else fail "L1 manifest unexpectedly has hashes"; fi
 
 # =============================================================================
@@ -237,16 +257,17 @@ echo; echo "--- PHASE SCOPE: LEVEL=2 SCOPE=security, EXCLUDE _backup ----"
 run_pass "LEVEL=2 SCOPE='security' EXCLUDE_DIRS='_backup'" "$RPT_SCOPE"
 echo "[structural diff stays whole-tree; content is scoped]"
 assert_count   "$RPT_SCOPE/missing_in_fat2.txt" 1     "SCOPE: full-tree differential still finds app.jar"
-assert_count   "$RPT_SCOPE/unrewritten.txt"     0     "SCOPE=security: bin/setenv.sh OUT of scope (0)"
-assert_grep    "$RPT_SCOPE/audit.txt" 'DIFFERS +security/keystore\.jks' "SCOPE: security keystore still compared"
-assert_no_grep "$RPT_SCOPE/audit.txt" 'lib/common\.jar' "SCOPE=security: lib/common.jar NOT compared (out of scope)"
+assert_count   "$RPT_SCOPE/unrewritten.txt"     0     "SCOPE=security: bin/setenv.sh + conf/*.properties OUT of scope (0)"
+assert_grep    "$RPT_SCOPE/audit.txt" 'CORRUPT\(bin\) +security/keystore\.jks' "SCOPE: security keystore still compared"
+assert_no_grep "$RPT_SCOPE/audit.txt" 'lib/common\.jar'                        "SCOPE=security: lib/common.jar NOT compared (out of scope)"
+assert_no_grep "$RPT_SCOPE/audit.txt" 'conf/migrated_ok'                       "SCOPE=security: conf/* rewrite NOT compared (out of scope)"
 
 # =============================================================================
 # 6. PHASE NOEXCL — LEVEL=2 without exclude: prove _backup pollutes.
 # =============================================================================
 echo; echo "--- PHASE NOEXCL: LEVEL=2, NO exclude (negative control) ----"
 run_pass "LEVEL=2" "$RPT_NOEXCL"
-assert_count "$RPT_NOEXCL/unrewritten.txt" 2 "WITHOUT exclude: unrewritten = 2 (setenv.sh + _backup/old_server.xml)"
+assert_count "$RPT_NOEXCL/unrewritten.txt" 3 "WITHOUT exclude: unrewritten = 3 (setenv.sh + not_rewritten.properties + _backup/old_server.xml)"
 assert_grep  "$RPT_NOEXCL/fat1.paths" '_backup' "WITHOUT exclude: _backup present (pollution confirmed)"
 
 # =============================================================================
