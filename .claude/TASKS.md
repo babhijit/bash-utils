@@ -37,9 +37,16 @@ Legend: [x] done · [ ] open · [~] in progress · [⏸] blocked/gated
 ## ENGAGEMENT — FAT2 repair (phased, approval-gated)
 
 ### Phase 0 — Discovery (READ-ONLY)  [~] current gate
-- [~] Operator deploys the repo on the host and runs, **as `opc_d2`**:
-      `FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 FAT1_USER=opc_d1 FAT2_USER=opc_d2 REPORT_DIR=/tmp/fat2_audit bash bin/audit_env.sh`
-- [ ] Operator returns `/tmp/fat2_audit/` (audit.txt + breakdown files).
+- [~] Operator deploys `bin/audit_env.sh` and runs **TWO passes** (opc_d2 can't read
+      all of FAT1, so each login owns its tree via a /tmp manifest handoff):
+      1. as opc_d1: `ROLE=fat1 FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 FAT1_USER=opc_d1 FAT2_USER=opc_d2 MANIFEST_DIR=/tmp/fat2_audit_handoff EXCLUDE_DIRS="_backup" bash bin/audit_env.sh`
+      2. as opc_d2: `ROLE=fat2 ... MANIFEST_DIR=/tmp/fat2_audit_handoff REPORT_DIR=/tmp/fat2_audit EXCLUDE_DIRS="_backup" bash bin/audit_env.sh`
+      (default run = `LEVEL=1` snapshot: scorecard + verdict + structural diff, no
+      content. Phase B: re-run both with `LEVEL=2 SCOPE="<flagged>"` to drill down.)
+- [ ] Operator returns `/tmp/fat2_audit/` (audit.txt + breakdown incl. GAP lists).
+- [x] Two-user (opc_d1/opc_d2) handoff verified on bash 4.2.46: `tests/audit_two_user_test.sh`
+      43/43 (both LEVELs + SCOPE drill-down; manifest captures opc_d2-unreadable files;
+      GAP set exact; EXCLUDE symmetric; LEVEL-1 skips content).
 - [ ] (Optional safety-first) rehearse the toolkit on a Linux box / `tests/docker` first.
 
 ### Phase 1 — Differential audit (READ-ONLY)  [⏸ gated on Phase 0 output]

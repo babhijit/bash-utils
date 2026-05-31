@@ -29,13 +29,27 @@ Current Focus: **FAT2 repair engagement, at the Phase 0 gate.** Read-only audit 
 
 ## Next Steps
 
-1. **PHASE 0 (now):** operator deploys the repo on the host and runs, as `opc_d2`:
+1. **PHASE 0 (now):** operator deploys `bin/audit_env.sh` (self-contained, the only
+   file needed) and runs **TWO passes** — `opc_d2` can't read all of FAT1, so each
+   login is authoritative for its own tree via a `/tmp` manifest handoff. Adjust
+   `EXCLUDE_DIRS` to the real backup-dir names (they hold stale opc_d1 configs):
    ```
-   FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
-   FAT1_USER=opc_d1 FAT2_USER=opc_d2 REPORT_DIR=/tmp/fat2_audit \
-   bash bin/audit_env.sh
+   # 1) as opc_d1 (writes FAT1 manifest to the handoff dir):
+   ROLE=fat1 FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
+     FAT1_USER=opc_d1 FAT2_USER=opc_d2 MANIFEST_DIR=/tmp/fat2_audit_handoff \
+     EXCLUDE_DIRS="_backup" bash bin/audit_env.sh
+   # 2) as opc_d2 (ingests manifest, writes report):
+   ROLE=fat2 FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
+     FAT1_USER=opc_d1 FAT2_USER=opc_d2 MANIFEST_DIR=/tmp/fat2_audit_handoff \
+     REPORT_DIR=/tmp/fat2_audit EXCLUDE_DIRS="_backup" bash bin/audit_env.sh
    ```
-   then returns `/tmp/fat2_audit/` (audit.txt + breakdown files).
+   then returns `/tmp/fat2_audit/` (audit.txt + breakdown incl. the readability-GAP
+   lists, a per-subsystem **scorecard**, and a heuristic **verdict**). This default
+   run is `LEVEL=1` (fast snapshot — no hashing/content/cert). **Phase B:** re-run
+   both passes with `LEVEL=2 SCOPE="<flagged subsystems>"` to drill into content +
+   checksums + cert decode where the verdict points. Verified on two real users
+   (bash 4.2.46): `tests/audit_two_user_test.sh` **43/43** (both levels + SCOPE +
+   exclude-symmetry + permission GAP) via the `bashutils7:audit` image.
 2. **PHASE 1/2:** Claude turns the report into differential tables, cert dispositions, and a **repair-vs-rebuild recommendation backed by the counts**.
 3. **PHASE 3:** present port-remap + path-remap + ownership model + per-cert disposition → get approval.
 4. **PHASE 4:** execute one subsystem at a time (FAT2 writes only), validate after each. If "rebuild", the parked phased pipeline is the mechanism.

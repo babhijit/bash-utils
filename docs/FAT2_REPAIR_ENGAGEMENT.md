@@ -103,17 +103,60 @@ and the rebuild pipeline is hardened + tested (to execute a rebuild trustworthil
 ## 6. Phase plan
 
 ### Phase 0 — Discovery (READ-ONLY)  ← **current gate**
-Run `bin/audit_env.sh` as `opc_d2` on the host. It maps both trees: layout,
-symlinks, Java/Tomcat/`server.xml`/`setenv.sh`, listening ports, env/shell-init,
-Oracle TNS/wallet/sqlnet, certs/keystores/truststores, cron/systemd; captures
-permission-denied (signal). **Command:**
+Run `bin/audit_env.sh` in **two passes, one per login** — because `opc_d2`
+cannot read all of FAT1 (some files are `0600`/owned-by-`opc_d1`; some dirs are
+untraversable), and a single `opc_d2` run would SILENTLY lose whole FAT1
+subtrees from the differential. Each login is authoritative for its OWN tree;
+`opc_d1` writes a manifest of FAT1's ground truth to a shared `/tmp` handoff, and
+`opc_d2` ingests it to compute the differential, symlink-shared classification,
+and binary checksum compare **without needing to read restricted FAT1 files** —
+and additionally measures the **readability GAP** (the exact FAT1 paths `opc_d2`
+cannot reach, which a rebuild must stage through `/tmp` via `opc_d1`).
+
+`EXCLUDE_DIRS` prunes backup/irrelevant subtrees (e.g. `_backup`) symmetrically
+from both trees so their stale configs/certs don't poison the decision counts.
+
+**Two dials:** `ROLE` (which login) × `LEVEL` (how deep). The decision may take
+several phases, so snapshot high-level first and drill down only where it matters:
+
+- **`LEVEL=1` (default) — SNAPSHOT.** Fast, no hashing/content-grep/cert-decode.
+  Per-subsystem file+byte **scorecard** (FAT1 vs FAT2), path differential counts,
+  symlink classification, ownership breakage, readability GAP, and a heuristic
+  **divergence VERDICT** that names the drifting subsystems to drill into.
+- **`LEVEL=2` — DRILL-DOWN.** Adds unrewritten-token grep, binary checksum
+  compare, cert decode, Tomcat/Oracle config. `SCOPE="sub1 sub2"` limits the
+  expensive content work to named top-level subsystems (the structural diff stays
+  whole-tree). Pass the SAME `LEVEL`/`SCOPE` to BOTH passes.
+
+**Phase A — snapshot** (adjust `EXCLUDE_DIRS` to the real backup dir names):
 ```
-FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
-FAT1_USER=opc_d1 FAT2_USER=opc_d2 REPORT_DIR=/tmp/fat2_audit \
-bash bin/audit_env.sh
+# 1) as opc_d1 — writes the FAT1 manifest to the shared handoff dir:
+ROLE=fat1 FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
+  FAT1_USER=opc_d1 FAT2_USER=opc_d2 MANIFEST_DIR=/tmp/fat2_audit_handoff \
+  EXCLUDE_DIRS="_backup" bash bin/audit_env.sh
+# 2) then as opc_d2 — ingests the manifest, writes the snapshot report:
+ROLE=fat2 FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
+  FAT1_USER=opc_d1 FAT2_USER=opc_d2 MANIFEST_DIR=/tmp/fat2_audit_handoff \
+  REPORT_DIR=/tmp/fat2_audit EXCLUDE_DIRS="_backup" bash bin/audit_env.sh
 ```
-Writes ONLY to `/tmp/fat2_audit/` (`audit.txt` + breakdown files). Operator returns
-the folder.
+**Phase B — drill down the subsystems the verdict flagged** (add `LEVEL=2 SCOPE=…`
+to BOTH passes, e.g.):
+```
+ROLE=fat1 LEVEL=2 SCOPE="security conf" ... EXCLUDE_DIRS="_backup" bash bin/audit_env.sh
+ROLE=fat2 LEVEL=2 SCOPE="security conf" ... REPORT_DIR=/tmp/fat2_audit_L2 \
+  EXCLUDE_DIRS="_backup" bash bin/audit_env.sh
+```
+It maps both trees: layout, symlinks, Java/Tomcat/`server.xml`/`setenv.sh`,
+listening ports, env/shell-init, Oracle TNS/wallet/sqlnet, certs/keystores/
+truststores, cron/systemd; captures permission-denied (signal). The fat2 pass
+writes ONLY to its `REPORT_DIR`; the fat1 pass ONLY to `MANIFEST_DIR`. Operator
+returns the report folder(s). Verified end-to-end on two real unix users on
+bash 4.2.46 via `tests/audit_two_user_test.sh` (43/43: both levels + SCOPE +
+exclude-symmetry + the permission GAP).
+
+> Single-login fallback (`ROLE=both`, the default ROLE) is for mock/CI/rehearsal
+> where one user can read both trees; it runs the manifest pass then the audit
+> pass in one process. NOT for the host, where the two-login split is the point.
 
 ### Phase 1 — Differential audit (READ-ONLY) — produced from the audit data
 - present in FAT1, **missing in FAT2** (not copied)
@@ -232,12 +275,20 @@ remains byte-for-byte untouched.**
 
 ## 11. Immediate next action
 
-**Phase 0, read-only.** Operator deploys the repo on the host and runs (as `opc_d2`):
+**Phase 0, read-only — TWO passes (one per login).** Operator deploys the repo on
+the host and runs, first as `opc_d1` then as `opc_d2`:
 ```
-FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
-FAT1_USER=opc_d1 FAT2_USER=opc_d2 REPORT_DIR=/tmp/fat2_audit \
-bash bin/audit_env.sh
+# 1) as opc_d1:
+ROLE=fat1 FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
+  FAT1_USER=opc_d1 FAT2_USER=opc_d2 MANIFEST_DIR=/tmp/fat2_audit_handoff \
+  EXCLUDE_DIRS="_backup" bash bin/audit_env.sh
+# 2) as opc_d2:
+ROLE=fat2 FAT1_ROOT=/applications/opc_d1 FAT2_ROOT=/applications/opc_d2 \
+  FAT1_USER=opc_d1 FAT2_USER=opc_d2 MANIFEST_DIR=/tmp/fat2_audit_handoff \
+  REPORT_DIR=/tmp/fat2_audit EXCLUDE_DIRS="_backup" bash bin/audit_env.sh
 ```
-then returns `/tmp/fat2_audit/`. Claude produces the Phase 1/2 differential tables,
-cert dispositions, and the repair-vs-rebuild recommendation. **No FAT2 writes until a
-Phase 3 plan is approved.**
+then returns `/tmp/fat2_audit/` (and `/tmp/fat2_audit_handoff/`). Only one file
+needs deploying: `bin/audit_env.sh` (self-contained, sources nothing). Claude
+produces the Phase 1/2 differential tables, cert dispositions, and the
+repair-vs-rebuild recommendation. **No FAT2 writes until a Phase 3 plan is
+approved.**

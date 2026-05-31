@@ -1,0 +1,19 @@
+# =============================================================================
+# Dockerfile.audit — test runtime for audit_env.sh's two-user handoff test.
+#
+# Extends bashutils7:rsync (centos:7 => bash 4.2.46 + GNU coreutils, + rsync)
+# with the openssl CLI so the FAT1/FAT2 cert-decode path is exercised on the
+# target's OpenSSL 1.0.2k. centos:7 base ships only the libssl library, not the
+# `openssl` command, so the audit's cert sections would otherwise be skipped.
+#
+# Build (once):
+#   docker build -t bashutils7:audit -f tests/docker/Dockerfile.audit .
+# Run the test:
+#   docker run --rm -v "$PWD":/repo:ro bashutils7:audit bash /repo/tests/audit_two_user_test.sh
+# =============================================================================
+FROM bashutils7:rsync
+
+# centos:7 is EOL; repoint yum at the vault archive, then add the openssl CLI.
+RUN sed -i 's|^mirrorlist=|#mirrorlist=|g; s|^#\{0,1\}baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|g' /etc/yum.repos.d/CentOS-*.repo \
+ && yum -y install openssl \
+ && yum clean all
