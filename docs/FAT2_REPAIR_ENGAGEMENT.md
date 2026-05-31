@@ -202,6 +202,24 @@ SSL_SERVER_DN_MATCH`. Determine each cert's **role** → reuse / repath / regene
 **Phase 2b:** keystore alias/validity that needs the **store password** — supplied
 securely (file/prompt, never CLI arg); deferred until needed.
 
+**REUSE-FIRST cert policy (operator-approved).** Reusing FAT1 certs / keystores /
+truststores / Oracle wallets in FAT2 **is acceptable as long as it works** — i.e.
+passes the functional validation (TLS handshake, client hostname check, Oracle
+connect). So the **default disposition is REUSE (copy FAT1 → FAT2, repath, fix
+perms); regenerate ONLY when reuse fails a functional test.** We still only READ
+FAT1 and WRITE FAT2 (a FAT1 cert `opc_d2` cannot read is in the GAP set → staged
+via `/tmp` by `opc_d1`). Reuse *works* when: server cert's CN/**SAN covers FAT2's
+access name** (same host + same hostname, different port = clean) and is
+**unexpired**; truststores always (CA-trust, env-agnostic); Oracle wallet contents
+reused but `WALLET_LOCATION` repath'd to FAT2 + files `opc_d2`-readable +
+`SSL_SERVER_DN_MATCH` still matches the DB DN; keystores keep the same storepass.
+Reuse **won't** work (→ regenerate) when: expired; FAT2 served under a hostname not
+in the SAN with strict client verification; or a key hard-bound to a FAT1-specific
+value the peer rejects. NOTE accepted: reusing client/mutual-TLS material means
+FAT2 authenticates **as FAT1** (same cryptographic identity) — fine for this dev
+env. Net effect: certs rarely force a rebuild — the security subsystem becomes a
+copy + repath + chmod punch-list.
+
 ### Phase 3 — Plan (→ approval)
 Port-remap table, path-remap table, permission/ownership model, per-cert
 disposition, and the **repair-vs-rebuild recommendation backed by the counts**.
@@ -220,7 +238,7 @@ Idempotent, logged, backup-before-edit scripts. (If "rebuild": the parked phased
 | 2 | FAT2 same hostname as FAT1 (diff port) or **different** hostname/URL? (server-cert reuse) | **Open — the audit answers it** (surfaces hostnames/SAN); operator confirms the FAT2 URL |
 | 3 | FAT1 & FAT2 → **same** Oracle DB/schema or **different**? (TNS/creds/wallet strategy) | **Open — the audit answers it** (surfaces `tnsnames`/connect strings); operator confirms intent |
 | 4 | Architecture: fully independent vs. thin (shared read-only binaries) | **Mostly independent**, with **some symlinks (both envs) pointing to the same location**; audit's symlink classification refines this |
-| 5 | Keystore/wallet passwords known? how supplied? | **Later/secure** — file or prompt, never CLI arg; not needed for read-only Phase 0–2 (Phase 2b) |
+| 5 | Keystore/wallet passwords known? how supplied? | **Later/secure** — file or prompt, never CLI arg; not needed for read-only Phase 0–2 (Phase 2b). **Reuse-first approved:** reuse FAT1 certs/keystores/wallets in FAT2 if functionally valid; regenerate only on failure (see Phase 2). |
 | 6 | FAT1 live/in active use? | **Assume yes** → read-only always |
 | 7 | Direct vs. indirect shell | **Settled: indirect** (operator runs scripts, returns output) |
 | 8 | Location of the migration scripts | **Settled: this repo** — audited + hardened; treated as suspect, not re-run blindly |
@@ -240,12 +258,16 @@ Idempotent, logged, backup-before-edit scripts. (If "rebuild": the parked phased
 3. **Symlinks — 3 modes:** (a) stale absolute into FAT1; (b) broken; (c) resolves to
    FAT1's **writable runtime** (logs/work/temp) → FAT2 corrupts FAT1. Relative vs.
    absolute matters.
-4. **Certs/TLS — role decides reuse:** server TLS keys on **hostname+chain** (same
-   host+hostname, diff port = fine); **client/mTLS identity** reuse means FAT2
-   authenticates *as FAT1* (flag!); truststores env-agnostic; Oracle wallets host- +
-   permission-bound (`WALLET_LOCATION` must point at FAT2); rule out **expiry** &
-   **pinning** before regenerating; never echo keystore passwords; key file perms
-   `0600`/`0640`.
+4. **Certs/TLS — REUSE-FIRST (operator-approved), role decides only the exceptions:**
+   default is **reuse FAT1 material** (copy → repath → fix perms); regenerate only
+   when reuse fails functionally. Server TLS keys on **hostname+chain** (same
+   host+hostname, diff port = fine; SAN must cover FAT2's name); **client/mTLS
+   identity** reuse means FAT2 authenticates *as FAT1* — **accepted** for this dev
+   env; truststores env-agnostic; Oracle wallets host- + permission-bound
+   (`WALLET_LOCATION` must point at FAT2, files `opc_d2`-readable); the only
+   blockers are **expiry**, **SAN-not-covering-FAT2-with-strict-verification**, and
+   **hard pinning** — rule those out, otherwise reuse. Never echo keystore
+   passwords; key file perms `0600`/`0640`. (Full policy: Phase 2 section.)
 5. **Permissions/ownership/ACLs:** `opc_d1`-owned files block FAT2 writes (work/temp/
    logs/upload must be `opc_d2`-writable); `0600`-owned-by-`opc_d1` secrets unreadable
    even in same group → need `0640`+shared group or a `opc_d2`-owned copy; check

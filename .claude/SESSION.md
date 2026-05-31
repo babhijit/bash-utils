@@ -68,7 +68,8 @@ Current Focus: **FAT2 repair engagement, at the Phase 0 gate.** Read-only audit 
 
 - **Single branch (`main`)** — operator preference; work directly on `main` going forward, no feature branches.
 - **Phase 0 ≠ selective_copy.** Phase 0 is read-only Discovery via `audit_env.sh`. The migration pipeline is the suspect + parked rebuild tool, untouched until approved.
-- **Let the data choose repair-in-place vs. clean rebuild** (≥~90% correct → repair; systemic → rebuild from FAT1 with broken FAT2 kept aside).
+- **Let the data choose repair-in-place vs. clean rebuild** (≥~90% correct → repair; systemic → rebuild from FAT1 with broken FAT2 kept aside). Quality of diffs outranks the %: any **CORRUPT binary** or inconsistent **DRIFT** pushes to rebuild (per-subsystem; hybrid is fine). Decision rubric in `docs/FAT2_REPAIR_ENGAGEMENT.md`.
+- **Cert/keystore/wallet REUSE-FIRST (operator-approved):** reuse FAT1 security material in FAT2 if it works (TLS handshake / client hostname / Oracle connect); regenerate only on functional failure. Read FAT1, write FAT2; unreadable FAT1 certs go via the GAP/`/tmp` route. (Full policy + conditions: engagement doc Phase 2.)
 - **Indirect shell** — Claude produces scripts; operator runs on host, returns output.
 - **Military-precision testing** — every change verified in centos:7/bash-4.2.46 with exactness + failure injection (saved to memory).
 - **No `Co-Authored-By: Claude`** on commits; author Abhijit Bandyopadhyay.
